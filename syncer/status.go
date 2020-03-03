@@ -54,6 +54,11 @@ func (s *Syncer) Status() interface{} {
 		st.MasterBinlogGtid = masterGTIDSet.String()
 	}
 
+	st.BinlogType = "unknown"
+	if s.streamerController != nil {
+		st.BinlogType = binlogTypeToString(s.streamerController.GetBinlogType())
+	}
+
 	// If a syncer unit is waiting for relay log catch up, it has not executed
 	// LoadMeta and will return a parsed binlog name error. As we can find mysql
 	// position in syncer status, we record this error only in debug level.
@@ -65,7 +70,12 @@ func (s *Syncer) Status() interface{} {
 
 	if s.cfg.IsSharding {
 		st.UnresolvedGroups = s.sgk.UnresolvedGroups()
-		st.BlockingDDLs = s.ddlExecInfo.BlockingDDLs()
 	}
+
+	pendingShardInfo := s.pessimist.PendingInfo()
+	if pendingShardInfo != nil {
+		st.BlockingDDLs = pendingShardInfo.DDLs
+	}
+
 	return st
 }

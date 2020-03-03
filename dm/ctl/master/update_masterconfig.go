@@ -15,7 +15,7 @@ package master
 
 import (
 	"context"
-	"fmt"
+	"os"
 
 	"github.com/pingcap/dm/dm/ctl/common"
 	"github.com/pingcap/dm/dm/pb"
@@ -27,8 +27,8 @@ import (
 // NewUpdateMasterConfigCmd creates a UpdateMasterConfig command
 func NewUpdateMasterConfigCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "update-master-config <config_file>",
-		Short: "update configure of dm-master",
+		Use:   "update-master-config <config-file>",
+		Short: "update the config of the DM-master",
 		Run:   updateMasterConfigFunc,
 	}
 	return cmd
@@ -36,7 +36,8 @@ func NewUpdateMasterConfigCmd() *cobra.Command {
 
 func updateMasterConfigFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) != 1 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 	content, err := common.GetFileContent(cmd.Flags().Arg(0))

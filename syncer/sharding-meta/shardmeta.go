@@ -17,11 +17,12 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/pingcap/errors"
 	"github.com/siddontang/go-mysql/mysql"
 	"go.uber.org/zap"
 
+	"github.com/pingcap/dm/pkg/binlog"
 	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/terror"
 	"github.com/pingcap/dm/pkg/utils"
 )
 
@@ -104,7 +105,7 @@ func (meta *ShardingMeta) RestoreFromData(sourceTableID string, activeIdx int, i
 	items := make([]*DDLItem, 0)
 	err := json.Unmarshal(data, &items)
 	if err != nil {
-		return errors.Trace(err)
+		return terror.ErrSyncUnitInvalidShardMeta.Delegate(err)
 	}
 	if isGlobal {
 		meta.global = &ShardingSequence{Items: items}
@@ -135,14 +136,14 @@ func (meta *ShardingMeta) checkItemExists(item *DDLItem) (int, bool) {
 		return 0, false
 	}
 	for idx, ddlItem := range source.Items {
-		if item.FirstPos.Compare(ddlItem.FirstPos) == 0 {
+		if binlog.ComparePosition(item.FirstPos, ddlItem.FirstPos) == 0 {
 			return idx, true
 		}
 	}
 	return len(source.Items), false
 }
 
-// AddItem adds a new comming DDLItem into ShardingMeta
+// AddItem adds a new coming DDLItem into ShardingMeta
 // 1. if DDLItem already exists in source sequence, check whether it is active DDL only
 // 2. add the DDLItem into its related source sequence
 // 3. if it is a new DDL in global sequence, add it into global sequence
@@ -174,7 +175,7 @@ func (meta *ShardingMeta) AddItem(item *DDLItem) (active bool, err error) {
 
 	global, source := meta.global, meta.sources[item.Source]
 	if !source.IsPrefixSequence(global) {
-		return false, errors.Errorf("detect inconsistent DDL sequence from source %+v, right DDL sequence should be %+v", source.Items, global.Items)
+		return false, terror.ErrSyncUnitDDLWrongSequence.Generate(source.Items, global.Items)
 	}
 
 	return index == meta.activeIdx, nil
@@ -229,7 +230,7 @@ func (meta *ShardingMeta) ResolveShardingDDL() bool {
 // ActiveDDLFirstPos returns the first binlog position of active DDL
 func (meta *ShardingMeta) ActiveDDLFirstPos() (mysql.Position, error) {
 	if meta.activeIdx >= len(meta.global.Items) {
-		return mysql.Position{}, errors.Errorf("activeIdx %d larger than length of global DDLItems: %v", meta.activeIdx, meta.global.Items)
+		return mysql.Position{}, terror.ErrSyncUnitDDLActiveIndexLarger.Generate(meta.activeIdx, meta.global.Items)
 	}
 	return meta.global.Items[meta.activeIdx].FirstPos, nil
 }

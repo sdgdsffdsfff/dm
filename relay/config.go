@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 
 	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/relay/retry"
 )
 
 // Config is the configuration for Relay.
@@ -24,7 +25,7 @@ type Config struct {
 	EnableGTID  bool     `toml:"enable-gtid" json:"enable-gtid"`
 	AutoFixGTID bool     `toml:"auto-fix-gtid" json:"auto-fix-gtid"`
 	RelayDir    string   `toml:"relay-dir" json:"relay-dir"`
-	ServerID    int      `toml:"server-id" json:"server-id"`
+	ServerID    uint32   `toml:"server-id" json:"server-id"`
 	Flavor      string   `toml:"flavor" json:"flavor"`
 	Charset     string   `toml:"charset" json:"charset"`
 	From        DBConfig `toml:"data-source" json:"data-source"`
@@ -33,6 +34,9 @@ type Config struct {
 	// do not need to specify binlog-pos, because relay will fetch the whole file
 	BinLogName string `toml:"binlog-name" json:"binlog-name"`
 	BinlogGTID string `toml:"binlog-gtid" json:"binlog-gtid"`
+
+	// for binlog reader retry
+	ReaderRetry retry.ReaderRetryConfig `toml:"reader-retry" json:"reader-retry"`
 }
 
 // DBConfig is the DB configuration.

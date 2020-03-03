@@ -16,31 +16,36 @@ package syncer
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/pingcap/dm/dm/config"
+	"github.com/pingcap/dm/dm/pb"
+	"github.com/pingcap/dm/pkg/binlog/event"
+	"github.com/pingcap/dm/pkg/conn"
+	tcontext "github.com/pingcap/dm/pkg/context"
+	"github.com/pingcap/dm/pkg/gtid"
+	"github.com/pingcap/dm/pkg/log"
+	parserpkg "github.com/pingcap/dm/pkg/parser"
+	"github.com/pingcap/dm/pkg/retry"
+	streamer2 "github.com/pingcap/dm/pkg/streamer"
+	"github.com/pingcap/dm/pkg/utils"
+
 	"github.com/DATA-DOG/go-sqlmock"
 	_ "github.com/go-sql-driver/mysql"
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/ast"
 	bf "github.com/pingcap/tidb-tools/pkg/binlog-filter"
 	cm "github.com/pingcap/tidb-tools/pkg/column-mapping"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	router "github.com/pingcap/tidb-tools/pkg/table-router"
-
+	"github.com/siddontang/go-mysql/mysql"
 	"github.com/siddontang/go-mysql/replication"
 	"go.uber.org/zap"
-
-	"github.com/pingcap/dm/dm/config"
-	"github.com/pingcap/dm/dm/pb"
-	"github.com/pingcap/dm/pkg/binlog/event"
-	"github.com/pingcap/dm/pkg/log"
-	parserpkg "github.com/pingcap/dm/pkg/parser"
-	"github.com/pingcap/dm/pkg/utils"
 )
 
 var _ = Suite(&testSyncerSuite{})
@@ -49,11 +54,64 @@ func TestSuite(t *testing.T) {
 	TestingT(t)
 }
 
+type mockBinlogEvents []mockBinlogEvent
+type mockBinlogEvent struct {
+	typ  int
+	args []interface{}
+}
+
+const (
+	DBCreate = iota
+	DBDrop
+	TableCreate
+	TableDrop
+
+	DDL
+
+	Write
+	Update
+	Delete
+)
+
 type testSyncerSuite struct {
-	db       *sql.DB
-	syncer   *replication.BinlogSyncer
-	streamer *replication.BinlogStreamer
-	cfg      *config.SubTaskConfig
+	streamer        *replication.BinlogStreamer
+	mockStreamer    streamer2.Streamer
+	cfg             *config.SubTaskConfig
+	eventsGenerator *event.Generator
+}
+
+type MockStreamer struct {
+	events []*replication.BinlogEvent
+	idx    uint32
+}
+
+func (m *MockStreamer) GetEvent(ctx context.Context) (*replication.BinlogEvent, error) {
+	if int(m.idx) >= len(m.events) {
+		return nil, context.Canceled
+	}
+	e := m.events[m.idx]
+	m.idx++
+	return e, nil
+}
+
+type MockStreamProducer struct {
+	events []*replication.BinlogEvent
+}
+
+func (mp *MockStreamProducer) generateStreamer(pos mysql.Position) (streamer2.Streamer, error) {
+	if pos.Pos == 4 {
+		return &MockStreamer{mp.events, 0}, nil
+	}
+	bytesLen := 0
+	idx := uint32(0)
+	for i, e := range mp.events {
+		bytesLen += len(e.RawData)
+		if pos.Pos == uint32(bytesLen) {
+			idx = uint32(i)
+			break
+		}
+	}
+	return &MockStreamer{mp.events, idx}, nil
 }
 
 func (s *testSyncerSuite) SetUpSuite(c *C) {
@@ -64,94 +122,119 @@ func (s *testSyncerSuite) SetUpSuite(c *C) {
 		MetaSchema: "test",
 		Name:       "syncer_ut",
 		Mode:       config.ModeIncrement,
+		Flavor:     "mysql",
 	}
 	s.cfg.From.Adjust()
 	s.cfg.To.Adjust()
 
-	dir := c.MkDir()
-	s.cfg.RelayDir = dir
+	s.cfg.UseRelay = false
 
-	var err error
-	dbAddr := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8", s.cfg.From.User, s.cfg.From.Password, s.cfg.From.Host, s.cfg.From.Port)
-	s.db, err = sql.Open("mysql", dbAddr)
-	if err != nil {
-		log.L().Fatal("", zap.Error(err))
-	}
-
-	s.resetMaster()
-	s.resetBinlogSyncer()
-
-	_, err = s.db.Exec("SET GLOBAL binlog_format = 'ROW';")
-	c.Assert(err, IsNil)
+	s.resetEventsGenerator(c)
 }
 
-func (s *testSyncerSuite) resetBinlogSyncer() {
-	var err error
-	cfg := replication.BinlogSyncerConfig{
-		ServerID:       uint32(s.cfg.ServerID),
-		Flavor:         "mysql",
-		Host:           s.cfg.From.Host,
-		Port:           uint16(s.cfg.From.Port),
-		User:           s.cfg.From.User,
-		Password:       s.cfg.From.Password,
-		UseDecimal:     true,
-		VerifyChecksum: true,
-	}
-	if s.cfg.Timezone != "" {
-		timezone, err2 := time.LoadLocation(s.cfg.Timezone)
-		if err != nil {
-			log.L().Fatal("", zap.Error(err2))
-		}
-		cfg.TimestampStringLocation = timezone
-	}
+func (s *testSyncerSuite) generateEvents(binlogEvents mockBinlogEvents, c *C) []*replication.BinlogEvent {
+	events := make([]*replication.BinlogEvent, 0, 1024)
+	for _, e := range binlogEvents {
+		switch e.typ {
+		case DBCreate:
+			evs, _, err := s.eventsGenerator.GenCreateDatabaseEvents(e.args[0].(string))
+			c.Assert(err, IsNil)
+			events = append(events, evs...)
+		case DBDrop:
+			evs, _, err := s.eventsGenerator.GenDropDatabaseEvents(e.args[0].(string))
+			c.Assert(err, IsNil)
+			events = append(events, evs...)
+		case TableCreate:
+			evs, _, err := s.eventsGenerator.GenCreateTableEvents(e.args[0].(string), e.args[1].(string))
+			c.Assert(err, IsNil)
+			events = append(events, evs...)
+		case TableDrop:
+			evs, _, err := s.eventsGenerator.GenDropTableEvents(e.args[0].(string), e.args[1].(string))
+			c.Assert(err, IsNil)
+			events = append(events, evs...)
 
-	if s.syncer != nil {
-		s.syncer.Close()
-	}
+		case DDL:
+			evs, _, err := s.eventsGenerator.GenDDLEvents(e.args[0].(string), e.args[1].(string))
+			c.Assert(err, IsNil)
+			events = append(events, evs...)
 
-	pos, _, err := utils.GetMasterStatus(s.db, "mysql")
-	if err != nil {
-		log.L().Fatal("", zap.Error(err))
-	}
-
-	s.syncer = replication.NewBinlogSyncer(cfg)
-	s.streamer, err = s.syncer.StartSync(pos)
-	if err != nil {
-		log.L().Fatal("", zap.Error(err))
-	}
-}
-
-func (s *testSyncerSuite) TearDownSuite(c *C) {
-	s.db.Close()
-}
-
-func (s *testSyncerSuite) resetMaster() {
-	s.db.Exec("reset master")
-}
-
-func (s *testSyncerSuite) catchUpBinlog() {
-	ch := make(chan interface{})
-	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		for {
-			ev, _ := s.streamer.GetEvent(ctx)
-			if ev == nil {
-				return
+		case Write, Update, Delete:
+			dmlData := []*event.DMLData{
+				{
+					TableID:    e.args[0].(uint64),
+					Schema:     e.args[1].(string),
+					Table:      e.args[2].(string),
+					ColumnType: e.args[3].([]byte),
+					Rows:       e.args[4].([][]interface{}),
+				},
 			}
-			ch <- struct{}{}
+			var eventType replication.EventType
+			switch e.typ {
+			case Write:
+				eventType = replication.WRITE_ROWS_EVENTv2
+			case Update:
+				eventType = replication.UPDATE_ROWS_EVENTv2
+			case Delete:
+				eventType = replication.DELETE_ROWS_EVENTv2
+			default:
+				c.Fatal(fmt.Sprintf("mock event generator don't support event type: %d", e.typ))
+			}
+			evs, _, err := s.eventsGenerator.GenDMLEvents(eventType, dmlData)
+			c.Assert(err, IsNil)
+			events = append(events, evs...)
 		}
-	}()
 
-	for {
-		select {
-		case <-ch:
-			// do nothing
-		case <-time.After(10 * time.Millisecond):
-			cancel()
-			return
-		}
 	}
+	return events
+}
+
+func (s *testSyncerSuite) resetMockStreamer(events []*replication.BinlogEvent) {
+	streamer := &MockStreamer{events: events, idx: 0}
+	s.mockStreamer = streamer
+}
+
+func (s *testSyncerSuite) resetEventsGenerator(c *C) {
+	previousGTIDSetStr := "3ccc475b-2343-11e7-be21-6c0b84d59f30:1-14,406a3f61-690d-11e7-87c5-6c92bf46f384:1-94321383"
+	previousGTIDSet, err := gtid.ParserGTID(s.cfg.Flavor, previousGTIDSetStr)
+	if err != nil {
+		c.Fatal(err)
+	}
+	latestGTIDStr := "3ccc475b-2343-11e7-be21-6c0b84d59f30:14"
+	latestGTID, err := gtid.ParserGTID(s.cfg.Flavor, latestGTIDStr)
+	s.eventsGenerator, err = event.NewGenerator(s.cfg.Flavor, uint32(s.cfg.ServerID), 0, latestGTID, previousGTIDSet, 0)
+	if err != nil {
+		c.Fatal(err)
+	}
+}
+
+func (s *testSyncerSuite) TearDownSuite(c *C) {}
+
+func (s *testSyncerSuite) mockParser(db *sql.DB, mock sqlmock.Sqlmock) (*parser.Parser, error) {
+	mock.ExpectQuery("SHOW GLOBAL VARIABLES LIKE").
+		WillReturnRows(sqlmock.NewRows([]string{"Variable_name", "Value"}).
+			AddRow("sql_mode", "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"))
+	return utils.GetParser(db, false)
+}
+
+func (s *testSyncerSuite) mockCheckPointCreate(checkPointMock sqlmock.Sqlmock, tag string) {
+	checkPointMock.ExpectBegin()
+	// we encode the line number to make it easier to figure out which expectation has failed.
+	checkPointMock.ExpectExec(fmt.Sprintf("(223:"+tag+")?INSERT INTO `%s`.`%s_syncer_checkpoint`", s.cfg.MetaSchema, s.cfg.Name)).WillReturnResult(sqlmock.NewResult(1, 1))
+	checkPointMock.ExpectExec(fmt.Sprintf("(224:"+tag+")?INSERT INTO `%s`.`%s_syncer_checkpoint`", s.cfg.MetaSchema, s.cfg.Name)).WillReturnResult(sqlmock.NewResult(1, 1))
+	// TODO because shardGroup DB is same as checkpoint DB, next time split them is better
+	checkPointMock.ExpectExec(fmt.Sprintf("(226:"+tag+")?DELETE FROM `%s`.`%s_syncer_sharding_meta(228)?", s.cfg.MetaSchema, s.cfg.Name)).WillReturnResult(sqlmock.NewResult(1, 1))
+	checkPointMock.ExpectCommit()
+}
+
+func (s *testSyncerSuite) mockCheckPointFlush(checkPointMock sqlmock.Sqlmock, tagInt int) {
+	tag := fmt.Sprintf("%d", tagInt)
+	checkPointMock.ExpectBegin()
+	checkPointMock.ExpectExec(fmt.Sprintf("(242:"+tag+")?INSERT INTO `%s`.`%s_syncer_checkpoint`", s.cfg.MetaSchema, s.cfg.Name)).WillReturnResult(sqlmock.NewResult(1, 1))
+	checkPointMock.ExpectExec(fmt.Sprintf("(243:"+tag+")?INSERT INTO `%s`.`%s_syncer_checkpoint`", s.cfg.MetaSchema, s.cfg.Name)).WillReturnResult(sqlmock.NewResult(1, 1))
+	checkPointMock.ExpectExec(fmt.Sprintf("(244:"+tag+")?INSERT INTO `%s`.`%s_syncer_checkpoint`", s.cfg.MetaSchema, s.cfg.Name)).WillReturnResult(sqlmock.NewResult(1, 1))
+	// TODO because shardGroup DB is same as checkpoint DB, next time split them is better
+	checkPointMock.ExpectExec(fmt.Sprintf("(246:"+tag+")?DELETE FROM `%s`.`%s_syncer_sharding_meta(239)?", s.cfg.MetaSchema, s.cfg.Name)).WillReturnResult(sqlmock.NewResult(1, 1))
+	checkPointMock.ExpectCommit()
 }
 
 func (s *testSyncerSuite) TestSelectDB(c *C) {
@@ -178,10 +261,14 @@ func (s *testSyncerSuite) TestSelectDB(c *C) {
 			skip:   skips[i]})
 	}
 
-	p, err := utils.GetParser(s.db, false)
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	p, err := s.mockParser(db, mock)
 	c.Assert(err, IsNil)
 
-	syncer := NewSyncer(s.cfg)
+	syncer := NewSyncer(s.cfg, nil)
+	syncer.bwList, err = filter.New(syncer.cfg.CaseSensitive, syncer.cfg.BWList)
+	c.Assert(err, IsNil)
 	err = syncer.genRouter()
 	c.Assert(err, IsNil)
 
@@ -212,8 +299,6 @@ func (s *testSyncerSuite) TestSelectDB(c *C) {
 }
 
 func (s *testSyncerSuite) TestSelectTable(c *C) {
-	s.resetBinlogSyncer()
-
 	s.cfg.BWList = &filter.Rules{
 		DoDBs: []string{"t2", "stest", "~^ptest*"},
 		DoTables: []*filter.Table{
@@ -222,33 +307,39 @@ func (s *testSyncerSuite) TestSelectTable(c *C) {
 			{Schema: "~^ptest*", Name: "~^t.*"},
 		},
 	}
+	s.resetEventsGenerator(c)
+	events := mockBinlogEvents{
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"s1"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"s1", "create table s1.log(id int)"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"s1"}},
 
-	sqls := []string{
-		"create database s1",
-		"create table s1.log(id int)",
-		"drop database s1",
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"mysql", "create table mysql.test(id int)"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"mysql", "test"}},
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"stest"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"stest", "create table stest.log(id int)"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"stest", "create table stest.t(id int)"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"stest", "create table stest.log2(id int)"}},
+		mockBinlogEvent{typ: Write, args: []interface{}{uint64(8), "stest", "t", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(10)}}}},
+		mockBinlogEvent{typ: Write, args: []interface{}{uint64(9), "stest", "log", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(10)}}}},
+		mockBinlogEvent{typ: Write, args: []interface{}{uint64(10), "stest", "log2", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(10)}}}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"stest", "log"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"stest", "t"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"stest", "log2"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"stest"}},
 
-		"create table mysql.test(id int)",
-		"drop table mysql.test",
-		"create database stest",
-		"create table stest.log(id int)",
-		"create table stest.t(id int)",
-		"create table stest.log2(id int)",
-		"insert into stest.t(id) values (10)",
-		"insert into stest.log(id) values (10)",
-		"insert into stest.log2(id) values (10)",
-		"drop table stest.log,stest.t,stest.log2",
-		"drop database stest",
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"t2"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"t2", "create table t2.log(id int)"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"t2", "create table t2.log1(id int)"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"t2", "log"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"t2"}},
 
-		"create database t2",
-		"create table t2.log(id int)",
-		"create table t2.log1(id int)",
-		"drop table t2.log",
-		"drop database t2",
-		"create database ptest1",
-		"create table ptest1.t1(id int)",
-		"drop database ptest1",
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"ptest1"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"ptest1", "create table ptest1.t1(id int)"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"ptest1"}},
 	}
+
+	allEvents := s.generateEvents(events, c)
+
 	res := [][]bool{
 		{true},
 		{true},
@@ -263,7 +354,9 @@ func (s *testSyncerSuite) TestSelectTable(c *C) {
 		{false},
 		{false},
 		{true},
-		{false, false, true},
+		{false},
+		{false},
+		{true},
 		{false},
 
 		{false},
@@ -271,37 +364,33 @@ func (s *testSyncerSuite) TestSelectTable(c *C) {
 		{true},
 		{true},
 		{false},
+
 		{false},
 		{false},
 		{false},
 	}
 
-	for _, sql := range sqls {
-		s.db.Exec(sql)
-	}
-
-	p, err := utils.GetParser(s.db, false)
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	p, err := s.mockParser(db, mock)
 	c.Assert(err, IsNil)
 
-	syncer := NewSyncer(s.cfg)
+	syncer := NewSyncer(s.cfg, nil)
+	syncer.bwList, err = filter.New(syncer.cfg.CaseSensitive, syncer.cfg.BWList)
+	c.Assert(err, IsNil)
 	syncer.genRouter()
-	var i int
-	for {
-		if i == len(sqls) {
-			break
-		}
-		e, err := s.streamer.GetEvent(context.Background())
-		c.Assert(err, IsNil)
+	i := 0
+	for _, e := range allEvents {
 		switch ev := e.Event.(type) {
 		case *replication.QueryEvent:
 			query := string(ev.Query)
+
 			result, err := syncer.parseDDLSQL(query, p, string(ev.Schema))
 			c.Assert(err, IsNil)
 			if !result.isDDL {
 				continue // BEGIN event
 			}
-
-			querys, _, err := syncer.resolveDDLSQL(p, result.stmt, string(ev.Schema))
+			querys, _, err := syncer.resolveDDLSQL(tcontext.Background(), p, result.stmt, string(ev.Schema))
 			c.Assert(err, IsNil)
 			if len(querys) == 0 {
 				continue
@@ -326,55 +415,48 @@ func (s *testSyncerSuite) TestSelectTable(c *C) {
 		}
 		i++
 	}
-	s.catchUpBinlog()
 }
 
 func (s *testSyncerSuite) TestIgnoreDB(c *C) {
-	s.resetMaster()
-	s.resetBinlogSyncer()
-
 	s.cfg.BWList = &filter.Rules{
 		IgnoreDBs: []string{"~^b.*", "s1", "stest"},
 	}
 
-	sqls := []string{
-		"create database s1",
-		"drop database s1",
-		"create database s2",
-		"drop database s2",
-		"create database btest",
-		"drop database btest",
-		"create database b1",
-		"drop database b1",
-		"create database stest",
-		"drop database stest",
-		"create database st",
-		"drop database st",
+	s.resetEventsGenerator(c)
+	events := mockBinlogEvents{
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"s1"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"s1"}},
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"s2"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"s2"}},
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"btest"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"btest"}},
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"b1"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"b1"}},
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"stest"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"stest"}},
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"st"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"st"}},
 	}
+
+	allEvents := s.generateEvents(events, c)
+
 	res := []bool{true, true, false, false, true, true, true, true, true, true, false, false}
 
-	for _, sql := range sqls {
-		s.db.Exec(sql)
-	}
-
-	p, err := utils.GetParser(s.db, false)
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	p, err := s.mockParser(db, mock)
 	c.Assert(err, IsNil)
 
-	syncer := NewSyncer(s.cfg)
+	syncer := NewSyncer(s.cfg, nil)
+	syncer.bwList, err = filter.New(syncer.cfg.CaseSensitive, syncer.cfg.BWList)
+	c.Assert(err, IsNil)
 	syncer.genRouter()
 	i := 0
-	for {
-		if i == len(sqls) {
-			break
-		}
-
-		e, err := s.streamer.GetEvent(context.Background())
-		c.Assert(err, IsNil)
+	for _, e := range allEvents {
 		ev, ok := e.Event.(*replication.QueryEvent)
 		if !ok {
 			continue
 		}
-
 		sql := string(ev.Query)
 		stmt, err := p.ParseOneStmt(sql, "", "")
 		c.Assert(err, IsNil)
@@ -386,12 +468,9 @@ func (s *testSyncerSuite) TestIgnoreDB(c *C) {
 		c.Assert(r, Equals, res[i])
 		i++
 	}
-	s.catchUpBinlog()
 }
 
 func (s *testSyncerSuite) TestIgnoreTable(c *C) {
-	s.resetBinlogSyncer()
-
 	s.cfg.BWList = &filter.Rules{
 		IgnoreDBs: []string{"t2"},
 		IgnoreTables: []*filter.Table{
@@ -400,29 +479,36 @@ func (s *testSyncerSuite) TestIgnoreTable(c *C) {
 		},
 	}
 
-	sqls := []string{
-		"create database s1",
-		"create table s1.log(id int)",
-		"drop database s1",
+	s.resetEventsGenerator(c)
+	events := mockBinlogEvents{
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"s1"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"s1", "create table s1.log(id int)"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"s1"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"mysql", "create table mysql.test(id int)"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"mysql", "test"}},
 
-		"create table mysql.test(id int)",
-		"drop table mysql.test",
-		"create database stest",
-		"create table stest.log(id int)",
-		"create table stest.t(id int)",
-		"create table stest.log2(id int)",
-		"insert into stest.t(id) values (10)",
-		"insert into stest.log(id) values (10)",
-		"insert into stest.log2(id) values (10)",
-		"drop table stest.log,stest.t,stest.log2",
-		"drop database stest",
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"stest"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"stest", "create table stest.log(id int)"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"stest", "create table stest.t(id int)"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"stest", "create table stest.log2(id int)"}},
 
-		"create database t2",
-		"create table t2.log(id int)",
-		"create table t2.log1(id int)",
-		"drop table t2.log",
-		"drop database t2",
+		mockBinlogEvent{typ: Write, args: []interface{}{uint64(8), "stest", "t", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(10)}}}},
+		mockBinlogEvent{typ: Write, args: []interface{}{uint64(9), "stest", "log", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(10)}}}},
+		mockBinlogEvent{typ: Write, args: []interface{}{uint64(10), "stest", "log2", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(10)}}}},
+		// TODO event generator support generate an event with multiple tables DDL
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"stest", "log"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"stest", "t"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"stest", "log2"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"stest"}},
+
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"t2"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"t2", "create table t2.log(id int)"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"t2", "create table t2.log1(id int)"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"t2", "log"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"t2"}},
 	}
+	allEvents := s.generateEvents(events, c)
+
 	res := [][]bool{
 		{false},
 		{false},
@@ -437,7 +523,9 @@ func (s *testSyncerSuite) TestIgnoreTable(c *C) {
 		{true},
 		{true},
 		{false},
-		{true, true, false},
+		{true},
+		{true},
+		{false},
 		{false},
 
 		{true},
@@ -447,23 +535,18 @@ func (s *testSyncerSuite) TestIgnoreTable(c *C) {
 		{true},
 	}
 
-	for _, sql := range sqls {
-		s.db.Exec(sql)
-	}
-
-	p, err := utils.GetParser(s.db, false)
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	p, err := s.mockParser(db, mock)
 	c.Assert(err, IsNil)
 
-	syncer := NewSyncer(s.cfg)
-
+	syncer := NewSyncer(s.cfg, nil)
+	syncer.bwList, err = filter.New(syncer.cfg.CaseSensitive, syncer.cfg.BWList)
+	c.Assert(err, IsNil)
 	syncer.genRouter()
+
 	i := 0
-	for {
-		if i == len(sqls) {
-			break
-		}
-		e, err := s.streamer.GetEvent(context.Background())
-		c.Assert(err, IsNil)
+	for _, e := range allEvents {
 		switch ev := e.Event.(type) {
 		case *replication.QueryEvent:
 			query := string(ev.Query)
@@ -473,7 +556,7 @@ func (s *testSyncerSuite) TestIgnoreTable(c *C) {
 				continue // BEGIN event
 			}
 
-			querys, _, err := syncer.resolveDDLSQL(p, result.stmt, string(ev.Schema))
+			querys, _, err := syncer.resolveDDLSQL(tcontext.Background(), p, result.stmt, string(ev.Schema))
 			c.Assert(err, IsNil)
 			if len(querys) == 0 {
 				continue
@@ -497,15 +580,11 @@ func (s *testSyncerSuite) TestIgnoreTable(c *C) {
 		default:
 			continue
 		}
-
 		i++
 	}
-	s.catchUpBinlog()
 }
 
 func (s *testSyncerSuite) TestSkipDML(c *C) {
-	s.resetBinlogSyncer()
-
 	s.cfg.FilterRules = []*bf.BinlogEventRule{
 		{
 			SchemaPattern: "*",
@@ -531,68 +610,93 @@ func (s *testSyncerSuite) TestSkipDML(c *C) {
 	}
 	s.cfg.BWList = nil
 
-	sqls := []struct {
-		sql     string
+	s.resetEventsGenerator(c)
+
+	type SQLChecker struct {
+		events  []*replication.BinlogEvent
 		isDML   bool
 		skipped bool
-	}{
-		{"drop database if exists foo", false, false},
-		{"create database foo", false, false},
-		{"create table foo.bar(id int)", false, false},
-		{"insert into foo.bar values(1)", true, false},
-		{"update foo.bar set id=2", true, true},
-		{"delete from foo.bar where id=2", true, true},
-		{"drop database if exists foo1", false, false},
-		{"create database foo1", false, false},
-		{"create table foo1.bar1(id int)", false, false},
-		{"insert into foo1.bar1 values(1)", true, false},
-		{"update foo1.bar1 set id=2", true, true},
-		{"delete from foo1.bar1 where id=2", true, true},
-		{"create table foo1.bar2(id int)", false, false},
-		{"insert into foo1.bar2 values(1)", true, false},
-		{"update foo1.bar2 set id=2", true, true},
-		{"delete from foo1.bar2 where id=2", true, true},
 	}
 
-	for i := range sqls {
-		s.db.Exec(sqls[i].sql)
-	}
+	sqls := make([]SQLChecker, 0, 16)
 
-	p, err := utils.GetParser(s.db, false)
+	evs := s.generateEvents([]mockBinlogEvent{{DBCreate, []interface{}{"foo"}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: false, skipped: false})
+
+	evs = s.generateEvents([]mockBinlogEvent{{TableCreate, []interface{}{"foo", "create table foo.bar(id int)"}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: false, skipped: false})
+
+	evs = s.generateEvents([]mockBinlogEvent{{Write, []interface{}{uint64(8), "foo", "bar", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(1)}}}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: true, skipped: false})
+
+	evs = s.generateEvents([]mockBinlogEvent{{Update, []interface{}{uint64(8), "foo", "bar", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(2)}, {int32(1)}}}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: true, skipped: true})
+
+	evs = s.generateEvents([]mockBinlogEvent{{Delete, []interface{}{uint64(8), "foo", "bar", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(2)}}}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: true, skipped: true})
+
+	evs = s.generateEvents([]mockBinlogEvent{{DBDrop, []interface{}{"foo1"}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: false, skipped: false})
+
+	evs = s.generateEvents([]mockBinlogEvent{{DBCreate, []interface{}{"foo1"}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: false, skipped: false})
+
+	evs = s.generateEvents([]mockBinlogEvent{{TableCreate, []interface{}{"foo1", "create table foo1.bar1(id int)"}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: false, skipped: false})
+
+	evs = s.generateEvents([]mockBinlogEvent{{Write, []interface{}{uint64(9), "foo1", "bar1", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(1)}}}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: true, skipped: false})
+
+	evs = s.generateEvents([]mockBinlogEvent{{Update, []interface{}{uint64(9), "foo1", "bar1", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(2)}, {int32(1)}}}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: true, skipped: true})
+
+	evs = s.generateEvents([]mockBinlogEvent{{Delete, []interface{}{uint64(9), "foo1", "bar1", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(2)}}}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: true, skipped: true})
+
+	evs = s.generateEvents([]mockBinlogEvent{{TableCreate, []interface{}{"foo1", "create table foo1.bar2(id int)"}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: false, skipped: false})
+
+	evs = s.generateEvents([]mockBinlogEvent{{Write, []interface{}{uint64(10), "foo1", "bar2", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(1)}}}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: true, skipped: false})
+
+	evs = s.generateEvents([]mockBinlogEvent{{Update, []interface{}{uint64(10), "foo1", "bar2", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(2)}, {int32(1)}}}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: true, skipped: true})
+
+	evs = s.generateEvents([]mockBinlogEvent{{Delete, []interface{}{uint64(10), "foo1", "bar2", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(2)}}}}}, c)
+	sqls = append(sqls, SQLChecker{events: evs, isDML: true, skipped: true})
+
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	p, err := s.mockParser(db, mock)
 	c.Assert(err, IsNil)
 
-	syncer := NewSyncer(s.cfg)
+	syncer := NewSyncer(s.cfg, nil)
 	syncer.genRouter()
 
 	syncer.binlogFilter, err = bf.NewBinlogEvent(false, s.cfg.FilterRules)
 	c.Assert(err, IsNil)
 
-	i := 0
-	for {
-		if i >= len(sqls) {
-			break
-		}
-		e, err := s.streamer.GetEvent(context.Background())
-		c.Assert(err, IsNil)
-		switch ev := e.Event.(type) {
-		case *replication.QueryEvent:
-			stmt, err := p.ParseOneStmt(string(ev.Query), "", "")
-			c.Assert(err, IsNil)
-			_, isDDL := stmt.(ast.DDLNode)
-			if !isDDL {
+	for _, sql := range sqls {
+		events := sql.events
+		for _, e := range events {
+			switch ev := e.Event.(type) {
+			case *replication.QueryEvent:
+				stmt, err := p.ParseOneStmt(string(ev.Query), "", "")
+				c.Assert(err, IsNil)
+				_, isDDL := stmt.(ast.DDLNode)
+				if !isDDL {
+					continue
+				}
+
+			case *replication.RowsEvent:
+				r, err := syncer.skipDMLEvent(string(ev.Table.Schema), string(ev.Table.Table), e.Header.EventType)
+				c.Assert(err, IsNil)
+				c.Assert(r, Equals, sql.skipped)
+			default:
 				continue
 			}
-
-		case *replication.RowsEvent:
-			r, err := syncer.skipDMLEvent(string(ev.Table.Schema), string(ev.Table.Table), e.Header.EventType)
-			c.Assert(err, IsNil)
-			c.Assert(r, Equals, sqls[i].skipped)
-		default:
-			continue
 		}
-		i++
 	}
-	s.catchUpBinlog()
 }
 
 func (s *testSyncerSuite) TestColumnMapping(c *C) {
@@ -613,55 +717,63 @@ func (s *testSyncerSuite) TestColumnMapping(c *C) {
 		},
 	}
 
-	createTableSQLs := []string{
-		"create database if not exists stest_3",
-		"create table if not exists stest_3.log(id varchar(45))",
-		"create table if not exists stest_3.t_2(name varchar(45), id bigint)",
-		"create table if not exists stest_3.a(id int)",
+	s.resetEventsGenerator(c)
+
+	//create db and tables
+	events := mockBinlogEvents{
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"stest_3"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"stest_3", "create table stest_3.log(id varchar(45))"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"stest_3", "create table stest_3.t_2(name varchar(45), id bigint)"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"stest_3", "create table stest_3.a(id int)"}},
 	}
 
-	dmls := []struct {
-		sql    string
+	createEvents := s.generateEvents(events, c)
+
+	// dmls
+	type dml struct {
+		events []*replication.BinlogEvent
 		column []string
 		data   []interface{}
-	}{
-		{"insert into stest_3.t_2(name, id) values (\"ian\", 10)", []string{"name", "id"}, []interface{}{"ian", int64(1<<59 | 3<<52 | 2<<44 | 10)}},
-		{"insert into stest_3.log(id) values (\"10\")", []string{"id"}, []interface{}{"test:10"}},
-		{"insert into stest_3.a(id) values (10)", []string{"id"}, []interface{}{int32(10)}},
 	}
 
-	dropTableSQLs := []string{
-		"drop table stest_3.log,stest_3.t_2,stest_3.a",
-		"drop database stest_3",
+	dmls := make([]dml, 0, 3)
+
+	evs := s.generateEvents([]mockBinlogEvent{{typ: Write, args: []interface{}{uint64(8), "stest_3", "t_2", []byte{mysql.MYSQL_TYPE_STRING, mysql.MYSQL_TYPE_LONG}, [][]interface{}{{"ian", int32(10)}}}}}, c)
+	dmls = append(dmls, dml{events: evs, column: []string{"name", "id"}, data: []interface{}{"ian", int64(1<<59 | 3<<52 | 2<<44 | 10)}})
+
+	evs = s.generateEvents([]mockBinlogEvent{{typ: Write, args: []interface{}{uint64(9), "stest_3", "log", []byte{mysql.MYSQL_TYPE_STRING}, [][]interface{}{{"10"}}}}}, c)
+	dmls = append(dmls, dml{events: evs, column: []string{"id"}, data: []interface{}{"test:10"}})
+
+	evs = s.generateEvents([]mockBinlogEvent{{typ: Write, args: []interface{}{uint64(10), "stest_3", "a", []byte{mysql.MYSQL_TYPE_LONG}, [][]interface{}{{int32(10)}}}}}, c)
+	dmls = append(dmls, dml{events: evs, column: []string{"id"}, data: []interface{}{int32(10)}})
+
+	dmlEvents := make([]*replication.BinlogEvent, 0, 15)
+	for _, dml := range dmls {
+		dmlEvents = append(dmlEvents, dml.events...)
 	}
 
-	for _, sql := range createTableSQLs {
-		s.db.Exec(sql)
+	// drop tables and db
+	events = mockBinlogEvents{
+		// TODO event generator support generate an event with multiple tables DDL
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"stest_3", "log"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"stest_3", "t_2"}},
+		mockBinlogEvent{typ: TableDrop, args: []interface{}{"stest_3", "a"}},
+		mockBinlogEvent{typ: DBDrop, args: []interface{}{"stest_3"}},
 	}
+	dropEvents := s.generateEvents(events, c)
 
-	for i := range dmls {
-		s.db.Exec(dmls[i].sql)
-	}
-
-	for _, sql := range dropTableSQLs {
-		s.db.Exec(sql)
-	}
-
-	p, err := utils.GetParser(s.db, false)
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	p, err := s.mockParser(db, mock)
 	c.Assert(err, IsNil)
 
 	mapping, err := cm.NewMapping(false, rules)
 	c.Assert(err, IsNil)
 
-	totalEvent := len(dmls) + len(createTableSQLs) + len(dropTableSQLs)
-	i := 0
+	allEvents := append(createEvents, dmlEvents...)
+	allEvents = append(allEvents, dropEvents...)
 	dmlIndex := 0
-	for {
-		if i == totalEvent {
-			break
-		}
-		e, err := s.streamer.GetEvent(context.Background())
-		c.Assert(err, IsNil)
+	for _, e := range allEvents {
 		switch ev := e.Event.(type) {
 		case *replication.QueryEvent:
 			stmt, err := p.ParseOneStmt(string(ev.Query), "", "")
@@ -678,120 +790,26 @@ func (s *testSyncerSuite) TestColumnMapping(c *C) {
 		default:
 			continue
 		}
-		i++
 	}
-	s.catchUpBinlog()
-}
-
-func (s *testSyncerSuite) TestTimezone(c *C) {
-	s.cfg.BWList = &filter.Rules{
-		DoDBs:     []string{"~^tztest_.*"},
-		IgnoreDBs: []string{"stest", "~^foo.*"},
-	}
-
-	createSQLs := []string{
-		"create database if not exists tztest_1",
-		"create table if not exists tztest_1.t_1(id int, a timestamp)",
-	}
-
-	testCases := []struct {
-		sqls     []string
-		timezone string
-	}{
-		{
-			[]string{
-				"insert into tztest_1.t_1(id, a) values (1, '1990-04-15 01:30:12')",
-				"insert into tztest_1.t_1(id, a) values (2, '1990-04-15 02:30:12')",
-				"insert into tztest_1.t_1(id, a) values (3, '1990-04-15 03:30:12')",
-			},
-			"Asia/Shanghai",
-		},
-		{
-			[]string{
-				"insert into tztest_1.t_1(id, a) values (4, '1990-04-15 01:30:12')",
-				"insert into tztest_1.t_1(id, a) values (5, '1990-04-15 02:30:12')",
-				"insert into tztest_1.t_1(id, a) values (6, '1990-04-15 03:30:12')",
-			},
-			"America/Phoenix",
-		},
-	}
-	queryTs := "select unix_timestamp(a) from `tztest_1`.`t_1` where id = ?"
-
-	dropSQLs := []string{
-		"drop table tztest_1.t_1",
-		"drop database tztest_1",
-	}
-
-	for _, sql := range createSQLs {
-		s.db.Exec(sql)
-	}
-
-	for _, testCase := range testCases {
-		s.cfg.Timezone = testCase.timezone
-		syncer := NewSyncer(s.cfg)
-		syncer.genRouter()
-		s.resetBinlogSyncer()
-
-		// we should not use `sql.DB.Exec` to do query which depends on session variables
-		// because `sql.DB.Exec` will choose a underlying Conn for every query from the connection pool
-		// and different Conn using different session
-		// ref: `sql.DB.Conn`
-		// and `set @@global` is also not reasonable, because it can not affect sessions already exist
-		// if we must ensure multi queries use the same session, we should use a transaction
-		txn, err := s.db.Begin()
-		c.Assert(err, IsNil)
-		txn.Exec("set @@session.time_zone = ?", testCase.timezone)
-		txn.Exec("set @@session.sql_mode = ''")
-		for _, sql := range testCase.sqls {
-			_, err = txn.Exec(sql)
-			c.Assert(err, IsNil)
-		}
-		err = txn.Commit()
-		c.Assert(err, IsNil)
-
-		location, err := time.LoadLocation(testCase.timezone)
-		c.Assert(err, IsNil)
-
-		idx := 0
-		for {
-			if idx >= len(testCase.sqls) {
-				break
-			}
-			e, err := s.streamer.GetEvent(context.Background())
-			c.Assert(err, IsNil)
-			switch ev := e.Event.(type) {
-			case *replication.RowsEvent:
-				skip, err := syncer.skipDMLEvent(string(ev.Table.Schema), string(ev.Table.Table), e.Header.EventType)
-				c.Assert(err, IsNil)
-				if skip {
-					continue
-				}
-
-				rowid := ev.Rows[0][0].(int32)
-				var ts sql.NullInt64
-				err2 := s.db.QueryRow(queryTs, rowid).Scan(&ts)
-				c.Assert(err2, IsNil)
-				c.Assert(ts.Valid, IsTrue)
-
-				raw := ev.Rows[0][1].(string)
-				data, err := time.ParseInLocation("2006-01-02 15:04:05", raw, location)
-				c.Assert(err, IsNil)
-				c.Assert(data.Unix(), DeepEquals, ts.Int64)
-				idx++
-			default:
-				continue
-			}
-		}
-	}
-
-	for _, sql := range dropSQLs {
-		s.db.Exec(sql)
-	}
-	s.catchUpBinlog()
 }
 
 func (s *testSyncerSuite) TestGeneratedColumn(c *C) {
-	defer s.db.Exec("drop database if exists gctest_1")
+	// TODO Currently mock eventGenerator don't support generate json,varchar field event, so use real mysql binlog event here
+	dbAddr := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8mb4", s.cfg.From.User, s.cfg.From.Password, s.cfg.From.Host, s.cfg.From.Port)
+	db, err := sql.Open("mysql", dbAddr)
+	if err != nil {
+		c.Fatal(err)
+	}
+	p, err := utils.GetParser(db, false)
+	c.Assert(err, IsNil)
+
+	_, err = db.Exec("SET GLOBAL binlog_format = 'ROW';")
+	c.Assert(err, IsNil)
+
+	pos, _, err := utils.GetMasterStatus(db, "mysql")
+	c.Assert(err, IsNil)
+
+	defer db.Exec("drop database if exists gctest_1")
 
 	s.cfg.BWList = &filter.Rules{
 		DoDBs: []string{"~^gctest_.*"},
@@ -922,18 +940,26 @@ func (s *testSyncerSuite) TestGeneratedColumn(c *C) {
 	}
 
 	for _, sql := range createSQLs {
-		_, err := s.db.Exec(sql)
+		_, err = db.Exec(sql)
 		c.Assert(err, IsNil)
 	}
 
-	syncer := NewSyncer(s.cfg)
-	syncer.cfg.MaxRetry = 1
-	// use upstream db as mock downstream
-	syncer.toDBs = []*Conn{{db: s.db}}
+	syncer := NewSyncer(s.cfg, nil)
+	// use upstream dbConn as mock downstream
+	dbConn, err := db.Conn(context.Background())
+	c.Assert(err, IsNil)
+	syncer.fromDB = &UpStreamConn{BaseDB: conn.NewBaseDB(db)}
+	syncer.ddlDBConn = &DBConn{baseConn: conn.NewBaseConn(dbConn, &retry.FiniteRetryStrategy{})}
+	syncer.toDBConns = []*DBConn{{baseConn: conn.NewBaseConn(dbConn, &retry.FiniteRetryStrategy{})}}
+	syncer.reset()
+
+	syncer.streamerController = NewStreamerController(tcontext.Background(), syncer.syncCfg, syncer.fromDB, syncer.binlogType, syncer.cfg.RelayDir, syncer.timezone)
+	err = syncer.streamerController.Start(tcontext.Background(), pos)
+	c.Assert(err, IsNil)
 
 	for _, testCase := range testCases {
 		for _, sql := range testCase.sqls {
-			_, err := s.db.Exec(sql)
+			_, err := db.Exec(sql)
 			c.Assert(err, IsNil, Commentf("sql: %s", sql))
 		}
 		idx := 0
@@ -941,27 +967,28 @@ func (s *testSyncerSuite) TestGeneratedColumn(c *C) {
 			if idx >= len(testCase.sqls) {
 				break
 			}
-			e, err := s.streamer.GetEvent(context.Background())
+			e, err := syncer.streamerController.GetEvent(tcontext.Background())
 			c.Assert(err, IsNil)
 			switch ev := e.Event.(type) {
 			case *replication.RowsEvent:
-				table, _, err := syncer.getTable(string(ev.Table.Schema), string(ev.Table.Table))
+				schemaName := string(ev.Table.Schema)
+				tableName := string(ev.Table.Table)
+				ti, err := syncer.getTable(schemaName, tableName, schemaName, tableName, p)
 				c.Assert(err, IsNil)
 				var (
 					sqls []string
 					args [][]interface{}
 				)
 
-				prunedColumns, prunedRows, err := pruneGeneratedColumnDML(table.columns, ev.Rows, table.schema, table.name, syncer.genColsCache)
+				prunedColumns, prunedRows, err := pruneGeneratedColumnDML(ti, ev.Rows)
 				c.Assert(err, IsNil)
 				param := &genDMLParam{
-					schema:               table.schema,
-					table:                table.name,
-					data:                 prunedRows,
-					originalData:         ev.Rows,
-					columns:              prunedColumns,
-					originalColumns:      table.columns,
-					originalIndexColumns: table.indexColumns,
+					schema:            schemaName,
+					table:             tableName,
+					data:              prunedRows,
+					originalData:      ev.Rows,
+					columns:           prunedColumns,
+					originalTableInfo: ti,
 				}
 				switch e.Header.EventType {
 				case replication.WRITE_ROWS_EVENTv0, replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2:
@@ -989,19 +1016,18 @@ func (s *testSyncerSuite) TestGeneratedColumn(c *C) {
 	}
 
 	for _, sql := range dropSQLs {
-		s.db.Exec(sql)
+		db.Exec(sql)
 	}
-	s.catchUpBinlog()
 }
 
 func (s *testSyncerSuite) TestcheckpointID(c *C) {
-	syncer := NewSyncer(s.cfg)
+	syncer := NewSyncer(s.cfg, nil)
 	checkpointID := syncer.checkpointID()
 	c.Assert(checkpointID, Equals, "101")
 }
 
 func (s *testSyncerSuite) TestExecErrors(c *C) {
-	syncer := NewSyncer(s.cfg)
+	syncer := NewSyncer(s.cfg, nil)
 	syncer.appendExecErrors(new(ExecErrorContext))
 	c.Assert(syncer.execErrors.errors, HasLen, 1)
 
@@ -1012,7 +1038,7 @@ func (s *testSyncerSuite) TestExecErrors(c *C) {
 func (s *testSyncerSuite) TestCasuality(c *C) {
 	var wg sync.WaitGroup
 	s.cfg.WorkerCount = 1
-	syncer := NewSyncer(s.cfg)
+	syncer := NewSyncer(s.cfg, nil)
 	syncer.jobs = []chan *job{make(chan *job, 1)}
 
 	wg.Add(1)
@@ -1039,258 +1065,7 @@ func (s *testSyncerSuite) TestCasuality(c *C) {
 	wg.Wait()
 }
 
-func (s *testSyncerSuite) TestSharding(c *C) {
-
-	createSQLs := []string{
-		"CREATE DATABASE IF NOT EXISTS `stest_1` CHARACTER SET = utf8mb4",
-		"CREATE TABLE IF NOT EXISTS `stest_1`.`st_1` (id INT, age INT)",
-		"CREATE TABLE IF NOT EXISTS `stest_1`.`st_2` (id INT, age INT)",
-	}
-
-	testCases := []struct {
-		testSQLs   []string
-		expectSQLS []struct {
-			sql  string
-			args []driver.Value
-		}
-	}{
-		// case 1:
-		// upstream binlog events:
-		// insert t1 -> insert t2 -> alter t1 -> insert t2 -> alter t2 -> insert t1(new schema) -> insert t2(new schema)
-		// downstream expected events:
-		// insert t(from t1) -> insert t(from t2) -> insert t(from t2) -> alter t(from t2 same as t1) -> insert t1(new schema) -> insert t2(new schema)
-		{
-			[]string{
-				"INSERT INTO `stest_1`.`st_1`(id, age) VALUES (1, 1)",
-				"INSERT INTO `stest_1`.`st_2`(id, age) VALUES (2, 2)",
-				"ALTER TABLE `stest_1`.`st_1` ADD COLUMN NAME VARCHAR(30)",
-				"INSERT INTO `stest_1`.`st_2`(id, age) VALUES (4, 4)",
-				"ALTER TABLE `stest_1`.`st_2` ADD COLUMN NAME VARCHAR(30)",
-				"INSERT INTO `stest_1`.`st_1`(id, age, name) VALUES (3, 3, 'test')",
-				"INSERT INTO `stest_1`.`st_2`(id, age, name) VALUES (6, 6, 'test')",
-			},
-			[]struct {
-				sql  string
-				args []driver.Value
-			}{
-				{
-					"REPLACE INTO",
-					[]driver.Value{1, 1},
-				},
-				{
-					"REPLACE INTO",
-					[]driver.Value{2, 2},
-				},
-				{
-					"REPLACE INTO",
-					[]driver.Value{4, 4},
-				},
-				{
-					"ALTER TABLE",
-					[]driver.Value{},
-				},
-				{
-					"REPLACE INTO",
-					[]driver.Value{3, 3, "test"},
-				},
-				{
-					"REPLACE INTO",
-					[]driver.Value{6, 6, "test"},
-				},
-			},
-		},
-		// case 2:
-		// upstream binlog events:
-		// insert t1 -> insert t2 -> alter t1 -> insert t1(new schema) -> insert t2 -> alter t2 -> insert t1(new schema) -> insert t2(new schema)
-		// downstream expected events:
-		// insert t(from t1) -> insert t(from t2) -> insert t(from t2) -> alter t(from t2 same as t1) -> insert t1(new schema) -> insert t1(new schema) -> insert t2(new schema)
-		{
-			[]string{
-				"INSERT INTO `stest_1`.`st_1`(id, age) VALUES (1, 1)",
-				"INSERT INTO `stest_1`.`st_2`(id, age) VALUES (2, 2)",
-				"ALTER TABLE `stest_1`.`st_1` ADD COLUMN NAME VARCHAR(30)",
-				"INSERT INTO `stest_1`.`st_1`(id, age, name) VALUES (3, 3, 'test')",
-				"INSERT INTO `stest_1`.`st_2`(id, age) VALUES (4, 4)",
-				"ALTER TABLE `stest_1`.`st_2` ADD COLUMN NAME VARCHAR(30)",
-				"INSERT INTO `stest_1`.`st_1`(id, age, name) VALUES (5, 5, 'test')",
-				"INSERT INTO `stest_1`.`st_2`(id, age, name) VALUES (6, 6, 'test')",
-			},
-			[]struct {
-				sql  string
-				args []driver.Value
-			}{
-				{
-					"REPLACE INTO",
-					[]driver.Value{1, 1},
-				},
-				{
-					"REPLACE INTO",
-					[]driver.Value{2, 2},
-				},
-				{
-					"REPLACE INTO",
-					[]driver.Value{4, 4},
-				},
-				{
-					"ALTER TABLE",
-					[]driver.Value{},
-				},
-				{
-					"REPLACE INTO",
-					[]driver.Value{3, 3, "test"},
-				},
-				{
-					"REPLACE INTO",
-					[]driver.Value{5, 5, "test"},
-				},
-				{
-					"REPLACE INTO",
-					[]driver.Value{6, 6, "test"},
-				},
-			},
-		},
-	}
-
-	dropSQLs := []string{
-		"DROP DATABASE IF EXISTS stest_1",
-		// drop checkpoint info for next test
-		fmt.Sprintf("DROP DATABASE IF EXISTS %s", s.cfg.MetaSchema),
-	}
-
-	runSQL := func(sqls []string) {
-		for _, sql := range sqls {
-			_, err := s.db.Exec(sql)
-			c.Assert(err, IsNil)
-		}
-	}
-
-	s.cfg.Flavor = "mysql"
-	s.cfg.BWList = &filter.Rules{
-		DoDBs: []string{"stest_1"},
-	}
-	s.cfg.IsSharding = true
-	s.cfg.RouteRules = []*router.TableRule{
-		{
-			SchemaPattern: "stest_1",
-			TablePattern:  "st_*",
-			TargetSchema:  "stest",
-			TargetTable:   "st",
-		},
-	}
-	// set batch to 1 is easy to mock
-	s.cfg.Batch = 1
-	s.cfg.WorkerCount = 1
-	s.cfg.MaxRetry = 1
-
-	for i, _case := range testCases {
-		// drop first if last time test failed
-		runSQL(dropSQLs)
-		s.resetMaster()
-		// must wait for reset Master finish
-		time.Sleep(time.Second)
-
-		db, mock, err := sqlmock.New()
-		if err != nil {
-			c.Fatalf("an error '%s' was not expected when opening a stub database connection", err)
-		}
-		syncer := NewSyncer(s.cfg)
-		syncer.Init()
-
-		c.Assert(syncer.checkpoint.GlobalPoint(), Equals, minCheckpoint)
-		c.Assert(syncer.checkpoint.FlushedGlobalPoint(), Equals, minCheckpoint)
-
-		// make syncer write to mock db
-		syncer.toDBs = []*Conn{{cfg: s.cfg, db: db}}
-		syncer.ddlDB = &Conn{cfg: s.cfg, db: db}
-
-		// run sql on upstream db to generate binlog event
-		runSQL(createSQLs)
-
-		// mock downstream db result
-		mock.ExpectBegin()
-		mock.ExpectExec("CREATE DATABASE").WillReturnResult(sqlmock.NewResult(1, 1))
-		mock.ExpectCommit()
-
-		mock.ExpectBegin()
-		mock.ExpectExec("CREATE TABLE").WillReturnResult(sqlmock.NewResult(1, 1))
-		mock.ExpectCommit()
-
-		mock.ExpectBegin()
-		e := newMysqlErr(1050, "Table exist")
-		mock.ExpectExec("CREATE TABLE").WillReturnError(e)
-		mock.ExpectRollback()
-
-		// mock get table in first handle RowEvent
-		mock.ExpectQuery("SHOW COLUMNS").WillReturnRows(
-			sqlmock.NewRows([]string{"Field", "Type", "Null", "Key", "Default", "Extra"}).AddRow("id", "int", "NO", "PRI", null, "").AddRow("age", "int", "NO", "", null, ""))
-		mock.ExpectQuery("SHOW INDEX").WillReturnRows(
-			sqlmock.NewRows([]string{"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name",
-				"Collation", "Cardinality", "Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment"},
-			).AddRow("st", 0, "PRIMARY", 1, "id", "A", 0, null, null, null, "BTREE", "", ""))
-
-		// run sql on upstream db
-		runSQL(_case.testSQLs)
-		// mock expect sql
-		for i, expectSQL := range _case.expectSQLS {
-			mock.ExpectBegin()
-			if strings.HasPrefix(expectSQL.sql, "ALTER") {
-				mock.ExpectExec(expectSQL.sql).WillReturnResult(sqlmock.NewResult(1, int64(i)+1))
-				mock.ExpectCommit()
-				// mock get table after ddl sql exec
-				mock.ExpectQuery("SHOW COLUMNS").WillReturnRows(
-					sqlmock.NewRows([]string{"Field", "Type", "Null", "Key", "Default", "Extra"}).AddRow("id", "int", "NO", "PRI", null, "").AddRow("age", "int", "NO", "", null, "").AddRow("name", "varchar", "NO", "", null, ""))
-				mock.ExpectQuery("SHOW INDEX").WillReturnRows(
-					sqlmock.NewRows([]string{"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name",
-						"Collation", "Cardinality", "Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment"},
-					).AddRow("st", 0, "PRIMARY", 1, "id", "A", 0, null, null, null, "BTREE", "", ""))
-			} else {
-				// change insert to replace because of safe mode
-				mock.ExpectExec(expectSQL.sql).WithArgs(expectSQL.args...).WillReturnResult(sqlmock.NewResult(1, 1))
-				mock.ExpectCommit()
-			}
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		resultCh := make(chan pb.ProcessResult)
-
-		go syncer.Process(ctx, resultCh)
-
-		go func() {
-			// sleep to ensure ddlExecInfo.Send() happen after ddlExecInfo.Renew() in Process
-			// because Renew() will generate new channel, Send() may send to old channel due to goroutine schedule
-			time.Sleep(1 * time.Second)
-			// mock permit exec ddl request from dm-master
-			req := &DDLExecItem{&pb.ExecDDLRequest{Exec: true}, make(chan error, 1)}
-			syncer.ddlExecInfo.Send(ctx, req)
-		}()
-
-		select {
-		case r := <-resultCh:
-			for _, err := range r.Errors {
-				c.Errorf("Case %d: Process Err:%s", i, err)
-			}
-			c.Assert(len(r.Errors), Equals, 0)
-		case <-time.After(2 * time.Second):
-		}
-		// wait for flush finish in Process.Run()
-		// cancel function only closed done channel asynchronously
-		// other goroutine(s.streamer.GetEvent()) received done msg then trigger flush
-		// so the flush action may not execute before we check due to goroutine schedule
-		cancel()
-
-		syncer.Close()
-		c.Assert(syncer.isClosed(), IsTrue)
-
-		flushedGP := syncer.checkpoint.FlushedGlobalPoint().Pos
-		GP := syncer.checkpoint.GlobalPoint().Pos
-		c.Assert(GP, Equals, flushedGP)
-
-		// check expectations for mock db
-		if err := mock.ExpectationsWereMet(); err != nil {
-			c.Errorf("there were unfulfilled expectations: %s", err)
-		}
-		runSQL(dropSQLs)
-	}
-}
+// TODO: add `TestSharding` later.
 
 func (s *testSyncerSuite) TestRun(c *C) {
 	// 1. run syncer with column mapping
@@ -1299,10 +1074,14 @@ func (s *testSyncerSuite) TestRun(c *C) {
 	// 4. update config, add route rules, and update syncer
 	// 5. execute somes sqls and then check jobs generated
 
-	defer s.db.Exec("drop database if exists test_1")
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+	dbConn, err := db.Conn(context.Background())
+	c.Assert(err, IsNil)
+	checkPointDB, checkPointMock, err := sqlmock.New()
+	checkPointDBConn, err := checkPointDB.Conn(context.Background())
+	c.Assert(err, IsNil)
 
-	s.resetMaster()
-	s.resetBinlogSyncer()
 	testJobs.jobs = testJobs.jobs[:0]
 
 	s.cfg.BWList = &filter.Rules{
@@ -1326,30 +1105,64 @@ func (s *testSyncerSuite) TestRun(c *C) {
 
 	s.cfg.Batch = 1000
 	s.cfg.WorkerCount = 2
+	s.cfg.MaxRetry = 1
 	s.cfg.DisableCausality = false
 
-	syncer := NewSyncer(s.cfg)
-	err := syncer.Init()
-	c.Assert(err, IsNil)
+	syncer := NewSyncer(s.cfg, nil)
+	syncer.fromDB = &UpStreamConn{BaseDB: conn.NewBaseDB(db)}
+	syncer.toDBConns = []*DBConn{{cfg: s.cfg, baseConn: conn.NewBaseConn(dbConn, &retry.FiniteRetryStrategy{})},
+		{cfg: s.cfg, baseConn: conn.NewBaseConn(dbConn, &retry.FiniteRetryStrategy{})}}
+	syncer.ddlDBConn = &DBConn{cfg: s.cfg, baseConn: conn.NewBaseConn(dbConn, &retry.FiniteRetryStrategy{})}
 	c.Assert(syncer.Type(), Equals, pb.UnitType_Sync)
+
+	syncer.columnMapping, err = cm.NewMapping(s.cfg.CaseSensitive, s.cfg.ColumnMappingRules)
+	c.Assert(err, IsNil)
+	syncer.genRouter()
+
+	checkPointMock.ExpectBegin()
+	checkPointMock.ExpectExec(fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS `%s`", s.cfg.MetaSchema)).WillReturnResult(sqlmock.NewResult(1, 1))
+	checkPointMock.ExpectCommit()
+	checkPointMock.ExpectBegin()
+	checkPointMock.ExpectExec(fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s`.`%s_syncer_checkpoint`", s.cfg.MetaSchema, s.cfg.Name)).WillReturnResult(sqlmock.NewResult(1, 1))
+	checkPointMock.ExpectCommit()
+
+	// mock syncer.checkpoint.Init() function
+	syncer.checkpoint.(*RemoteCheckPoint).dbConn = &DBConn{cfg: s.cfg, baseConn: conn.NewBaseConn(checkPointDBConn, &retry.FiniteRetryStrategy{})}
+	syncer.checkpoint.(*RemoteCheckPoint).prepare(tcontext.Background())
+
+	syncer.reset()
+	events1 := mockBinlogEvents{
+		mockBinlogEvent{typ: DBCreate, args: []interface{}{"test_1"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"test_1", "create table test_1.t_1(id int primary key, name varchar(24))"}},
+		mockBinlogEvent{typ: TableCreate, args: []interface{}{"test_1", "create table test_1.t_2(id int primary key, name varchar(24))"}},
+
+		mockBinlogEvent{typ: Write, args: []interface{}{uint64(8), "test_1", "t_1", []byte{mysql.MYSQL_TYPE_LONG, mysql.MYSQL_TYPE_STRING}, [][]interface{}{{int32(1), "a"}}}},
+		mockBinlogEvent{typ: DDL, args: []interface{}{"test_1", "alter table test_1.t_1 add index index1(name)"}},
+		mockBinlogEvent{typ: Write, args: []interface{}{uint64(8), "test_1", "t_1", []byte{mysql.MYSQL_TYPE_LONG, mysql.MYSQL_TYPE_STRING}, [][]interface{}{{int32(2), "b"}}}},
+		mockBinlogEvent{typ: Delete, args: []interface{}{uint64(8), "test_1", "t_1", []byte{mysql.MYSQL_TYPE_LONG, mysql.MYSQL_TYPE_STRING}, [][]interface{}{{int32(1), "a"}}}},
+		mockBinlogEvent{typ: Update, args: []interface{}{uint64(8), "test_1", "t_1", []byte{mysql.MYSQL_TYPE_LONG, mysql.MYSQL_TYPE_STRING}, [][]interface{}{{int32(2), "b"}, {int32(1), "b"}}}},
+	}
+
+	mockStreamerProducer := &MockStreamProducer{s.generateEvents(events1, c)}
+	mockStreamer, err := mockStreamerProducer.generateStreamer(mysql.Position{})
+	c.Assert(err, IsNil)
+	syncer.streamerController = &StreamerController{
+		streamerProducer: mockStreamerProducer,
+		streamer:         mockStreamer,
+	}
 
 	syncer.addJobFunc = syncer.addJobToMemory
 
 	ctx, cancel := context.WithCancel(context.Background())
 	resultCh := make(chan pb.ProcessResult)
 
+	// mock get parser
+	mock.ExpectQuery("SHOW GLOBAL VARIABLES LIKE").
+		WillReturnRows(sqlmock.NewRows([]string{"Variable_name", "Value"}).
+			AddRow("sql_mode", "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"))
+
 	go syncer.Process(ctx, resultCh)
 
-	sqls1 := []string{
-		"create database if not exists test_1",
-		"create table if not exists test_1.t_1(id int primary key, name varchar(24))",
-		"create table if not exists test_1.t_2(id int primary key, name varchar(24))",
-		"insert into test_1.t_1 values(1, 'a')",
-		"alter table test_1.t_1 add index index1(name)",
-		"insert into test_1.t_1 values(2, 'b')",
-		"delete from test_1.t_1 where id = 1",
-		"update test_1.t_1 set id = 1 where id = 2", // will find casuality and then generate flush job
-	}
 	expectJobs1 := []*expectJob{
 		{
 			ddl,
@@ -1396,7 +1209,9 @@ func (s *testSyncerSuite) TestRun(c *C) {
 		},
 	}
 
-	executeSQLAndWait(c, s.db, sqls1, len(expectJobs1))
+	executeSQLAndWait(len(expectJobs1))
+	c.Assert(syncer.Status().(*pb.SyncStatus).TotalEvents, Equals, int64(0))
+	syncer.mockFinishJob(expectJobs1)
 
 	testJobs.Lock()
 	checkJobs(c, testJobs.jobs, expectJobs1)
@@ -1418,24 +1233,31 @@ func (s *testSyncerSuite) TestRun(c *C) {
 	syncer.Pause()
 	syncer.Update(s.cfg)
 
-	s.resetMaster()
-	s.resetBinlogSyncer()
+	events2 := mockBinlogEvents{
+		mockBinlogEvent{typ: Write, args: []interface{}{uint64(8), "test_1", "t_1", []byte{mysql.MYSQL_TYPE_LONG, mysql.MYSQL_TYPE_STRING}, [][]interface{}{{int32(3), "c"}}}},
+		mockBinlogEvent{typ: Delete, args: []interface{}{uint64(8), "test_1", "t_1", []byte{mysql.MYSQL_TYPE_LONG, mysql.MYSQL_TYPE_STRING}, [][]interface{}{{int32(3), "c"}}}},
+	}
+
+	mock.ExpectQuery("SHOW GLOBAL VARIABLES LIKE").
+		WillReturnRows(sqlmock.NewRows([]string{"Variable_name", "Value"}).
+			AddRow("sql_mode", "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"))
 
 	ctx, cancel = context.WithCancel(context.Background())
 	resultCh = make(chan pb.ProcessResult)
-	go syncer.Resume(ctx, resultCh)
-
-	sql2 := []string{
-		"insert into test_1.t_1 values(3, 'c')",
-		"delete from test_1.t_1 where id = 3",
+	// simulate `syncer.Resume` here, but doesn't reset database conns
+	syncer.reset()
+	mockStreamerProducer = &MockStreamProducer{s.generateEvents(events2, c)}
+	mockStreamer, err = mockStreamerProducer.generateStreamer(mysql.Position{})
+	c.Assert(err, IsNil)
+	syncer.streamerController = &StreamerController{
+		streamerProducer: mockStreamerProducer,
+		streamer:         mockStreamer,
 	}
+
+	go syncer.Process(ctx, resultCh)
 
 	expectJobs2 := []*expectJob{
 		{
-			flush,
-			"",
-			nil,
-		}, {
 			insert,
 			"REPLACE INTO `test_1`.`t_2` (`id`,`name`) VALUES (?,?);",
 			[]interface{}{int32(3), "c"},
@@ -1446,27 +1268,29 @@ func (s *testSyncerSuite) TestRun(c *C) {
 		},
 	}
 
-	executeSQLAndWait(c, s.db, sql2, len(expectJobs2))
+	executeSQLAndWait(len(expectJobs2))
+	c.Assert(syncer.Status().(*pb.SyncStatus).TotalEvents, Equals, int64(len(expectJobs1)))
+	syncer.mockFinishJob(expectJobs2)
+	c.Assert(syncer.Status().(*pb.SyncStatus).TotalEvents, Equals, int64(len(expectJobs1)+len(expectJobs2)))
 
 	testJobs.RLock()
 	checkJobs(c, testJobs.jobs, expectJobs2)
 	testJobs.RUnlock()
 
-	status := syncer.Status().(*pb.SyncStatus)
-	c.Assert(status.TotalEvents, Equals, int64(len(expectJobs1)+len(expectJobs2)))
-
 	cancel()
 	syncer.Close()
 	c.Assert(syncer.isClosed(), IsTrue)
-}
 
-func executeSQLAndWait(c *C, db *sql.DB, sqls []string, expectJobNum int) {
-	for _, sql := range sqls {
-		c.Log("exec sql: ", sql)
-		_, err := db.Exec(sql)
-		c.Assert(err, IsNil)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		c.Errorf("db unfulfilled expectations: %s", err)
 	}
 
+	if err := checkPointMock.ExpectationsWereMet(); err != nil {
+		c.Errorf("checkpointDB unfulfilled expectations: %s", err)
+	}
+}
+
+func executeSQLAndWait(expectJobNum int) {
 	for i := 0; i < 10; i++ {
 		time.Sleep(time.Second)
 
@@ -1487,7 +1311,7 @@ type expectJob struct {
 }
 
 func checkJobs(c *C, jobs []*job, expectJobs []*expectJob) {
-	c.Assert(jobs, HasLen, len(expectJobs))
+	c.Assert(len(jobs), Equals, len(expectJobs), Commentf("jobs = %q", jobs))
 	for i, job := range jobs {
 		c.Log(i, job.tp, job.ddls, job.sql, job.args)
 
@@ -1504,6 +1328,15 @@ func checkJobs(c *C, jobs []*job, expectJobs []*expectJob) {
 var testJobs struct {
 	sync.RWMutex
 	jobs []*job
+}
+
+func (s *Syncer) mockFinishJob(jobs []*expectJob) {
+	for _, job := range jobs {
+		switch job.tp {
+		case ddl, insert, update, del, flush:
+			s.addCount(true, "test", job.tp, 1)
+		}
+	}
 }
 
 func (s *Syncer) addJobToMemory(job *job) error {

@@ -13,6 +13,21 @@
 
 package mydumper
 
+import (
+	"strings"
+
+	"github.com/pingcap/dm/dm/config"
+	"github.com/pingcap/dm/pkg/conn"
+	"github.com/pingcap/dm/pkg/terror"
+	"github.com/pingcap/dm/pkg/utils"
+
+	"github.com/pingcap/tidb-tools/pkg/filter"
+	router "github.com/pingcap/tidb-tools/pkg/table-router"
+)
+
+var applyNewBaseDB = conn.DefaultDBProvider.Apply
+var fetchTargetDoTables = utils.FetchTargetDoTables
+
 // ParseArgLikeBash parses list arguments like bash, which helps us to run
 // executable command via os/exec more likely running from bash
 func ParseArgLikeBash(args []string) []string {
@@ -36,4 +51,50 @@ func trimOutQuotes(arg string) string {
 		}
 	}
 	return arg
+}
+
+// fetchMyDumperDoTables fetches and filters the tables that needed to be dumped through black-white list and route rules
+func fetchMyDumperDoTables(cfg *config.SubTaskConfig) (string, error) {
+	fromDB, err := applyNewBaseDB(cfg.From)
+	if err != nil {
+		return "", terror.WithClass(err, terror.ClassDumpUnit)
+	}
+	defer fromDB.Close()
+	bw, err := filter.New(cfg.CaseSensitive, cfg.BWList)
+	if err != nil {
+		return "", terror.ErrDumpUnitGenBWList.Delegate(err)
+	}
+	r, err := router.NewTableRouter(cfg.CaseSensitive, cfg.RouteRules)
+	if err != nil {
+		return "", terror.ErrDumpUnitGenTableRouter.Delegate(err)
+	}
+	sourceTables, err := fetchTargetDoTables(fromDB.DB, bw, r)
+	if err != nil {
+		return "", terror.WithClass(err, terror.ClassDumpUnit)
+	}
+	var filteredTables []string
+	// TODO: For tables which contains special chars like ' , ` mydumper will fail while dumping. Once this bug is fixed on mydumper we should add quotes to table.Schema and table.Name
+	for _, tables := range sourceTables {
+		for _, table := range tables {
+			filteredTables = append(filteredTables, table.Schema+"."+table.Name)
+		}
+	}
+	return strings.Join(filteredTables, ","), nil
+}
+
+// needToGenerateDoTables will check whether customers specify the databases/tables that needed to be dumped
+// If not, this function will return true to notify mydumper to generate args
+func needToGenerateDoTables(args []string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-B") || strings.HasPrefix(arg, "--database") {
+			return false
+		}
+		if strings.HasPrefix(arg, "-T") || strings.HasPrefix(arg, "--tables-list") {
+			return false
+		}
+		if strings.HasPrefix(arg, "-x") || strings.HasPrefix(arg, "--regex") {
+			return false
+		}
+	}
+	return true
 }

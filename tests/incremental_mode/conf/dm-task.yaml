@@ -3,8 +3,8 @@ name: test
 task-mode: task-mode-placeholder
 is-sharding: false
 meta-schema: "dm_meta"
-remove-meta: true
-enable-heartbeat: true
+remove-meta: false
+# enable-heartbeat: true
 heartbeat-update-interval: 1
 heartbeat-report-interval: 1
 timezone: "Asia/Shanghai"
@@ -44,7 +44,7 @@ mydumpers:
     threads: 4
     chunk-filesize: 64
     skip-tz-utc: true
-    extra-args: "-B incremental_mode"
+    extra-args: ""
 
 loaders:
   global:
@@ -55,4 +55,3 @@ syncers:
   global:
     worker-count: 16
     batch: 100
-    max-retry: 100

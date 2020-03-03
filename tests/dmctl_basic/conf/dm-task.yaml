@@ -71,7 +71,7 @@ mydumpers:
     threads: 4
     chunk-filesize: 64
     skip-tz-utc: true
-    extra-args: "--regex '^dmctl.*'"
+    extra-args: ""
 
 loaders:
   global:
@@ -82,4 +82,3 @@ syncers:
   global:
     worker-count: 16
     batch: 100
-    max-retry: 100

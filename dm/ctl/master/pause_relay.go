@@ -15,6 +15,7 @@ package master
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/pingcap/errors"
 	"github.com/spf13/cobra"
@@ -26,8 +27,8 @@ import (
 // NewPauseRelayCmd creates a PauseRelay command
 func NewPauseRelayCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "pause-relay <-w worker ...>",
-		Short: "pause dm-worker's relay unit",
+		Use:   "pause-relay <-s source ...>",
+		Short: "pause DM-worker's relay unit",
 		Run:   pauseRelayFunc,
 	}
 	return cmd
@@ -36,21 +37,22 @@ func NewPauseRelayCmd() *cobra.Command {
 // pauseRelayFunc does pause relay request
 func pauseRelayFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) > 0 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 
-	workers, err := common.GetWorkerArgs(cmd)
+	sources, err := common.GetSourceArgs(cmd)
 	if err != nil {
 		common.PrintLines("%s", errors.ErrorStack(err))
 		return
 	}
-	if len(workers) == 0 {
-		fmt.Println("must specify at least one dm-worker (`-w` / `--worker`)")
+	if len(sources) == 0 {
+		fmt.Println("must specify at least one source (`-s` / `--source`)")
 		return
 	}
 
-	resp, err := common.OperateRelay(pb.RelayOp_PauseRelay, workers)
+	resp, err := common.OperateRelay(pb.RelayOp_PauseRelay, sources)
 	if err != nil {
 		common.PrintLines("can not pause relay unit:\n%v", errors.ErrorStack(err))
 		return

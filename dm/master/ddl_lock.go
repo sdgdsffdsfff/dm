@@ -78,8 +78,6 @@ package master
 import (
 	"fmt"
 	"sync"
-
-	"github.com/pingcap/errors"
 )
 
 // genDDLLockID generates a DDL lock ID
@@ -119,7 +117,7 @@ func (lk *LockKeeper) TrySync(task, schema, table, worker string, stmts []string
 	}
 
 	synced, remain, err := l.TrySync(worker, workers, stmts)
-	return lockID, synced, remain, errors.Trace(err)
+	return lockID, synced, remain, err
 }
 
 // RemoveLock removes a lock
@@ -144,7 +142,7 @@ func (lk *LockKeeper) FindLock(lockID string) *Lock {
 func (lk *LockKeeper) Locks() map[string]*Lock {
 	lk.RLock()
 	defer lk.RUnlock()
-	locks := make(map[string]*Lock)
+	locks := make(map[string]*Lock, len(lk.locks))
 	for k, v := range lk.locks {
 		locks[k] = v
 	}

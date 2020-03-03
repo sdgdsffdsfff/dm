@@ -16,10 +16,10 @@ package relay
 import (
 	"time"
 
-	"github.com/pingcap/errors"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/terror"
 	"github.com/pingcap/dm/pkg/utils"
 )
 
@@ -50,13 +50,13 @@ var (
 			Help:      "current relay sub directory index",
 		}, []string{"node", "uuid"})
 
-	// should alert if avaiable space < 10G
+	// should alert if available space < 10G
 	relayLogSpaceGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "dm",
 			Subsystem: "relay",
 			Name:      "space",
-			Help:      "the space of storge for relay component",
+			Help:      "the space of storage for relay component",
 		}, []string{"type"}) // type can be 'capacity' and 'available'.
 
 	// should alert
@@ -83,7 +83,7 @@ var (
 			Subsystem: "relay",
 			Name:      "write_duration",
 			Help:      "bucketed histogram of write time (s) of single relay log event",
-			Buckets:   prometheus.ExponentialBuckets(0.00005, 2, 18),
+			Buckets:   prometheus.ExponentialBuckets(0.00005, 2, 20),
 		})
 
 	// should alert
@@ -110,7 +110,16 @@ var (
 			Subsystem: "relay",
 			Name:      "read_binlog_duration",
 			Help:      "bucketed histogram of read time (s) of single binlog event from the master.",
-			Buckets:   prometheus.ExponentialBuckets(0.00005, 2, 18),
+			Buckets:   prometheus.ExponentialBuckets(0.00005, 2, 20),
+		})
+
+	binlogTransformDurationHistogram = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "dm",
+			Subsystem: "relay",
+			Name:      "read_transform_duration",
+			Help:      "bucketed histogram of transform time (s) of single binlog event.",
+			Buckets:   prometheus.ExponentialBuckets(0.00005, 2, 20),
 		})
 
 	// should alert
@@ -140,7 +149,7 @@ func RegisterMetrics(registry *prometheus.Registry) {
 
 func reportRelayLogSpaceInBackground(dirpath string) error {
 	if len(dirpath) == 0 {
-		return errors.New("dirpath is empty")
+		return terror.ErrRelayLogDirpathEmpty.Generate()
 	}
 
 	go func() {

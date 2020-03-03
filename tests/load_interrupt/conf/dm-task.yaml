@@ -4,7 +4,7 @@ task-mode: full
 is-sharding: false
 meta-schema: "dm_meta"
 remove-meta: false
-enable-heartbeat: true
+# enable-heartbeat: true
 timezone: "Asia/Shanghai"
 
 target-database:
@@ -20,12 +20,6 @@ mysql-instances:
     loader-config-name: "global"
     syncer-config-name: "global"
 
-  - source-id: "mysql-replica-02"
-    black-white-list:  "instance"
-    mydumper-config-name: "global"
-    loader-config-name: "global"
-    syncer-config-name: "global"
-
 black-white-list:
   instance:
     do-dbs: ["load_interrupt"]
@@ -36,7 +30,7 @@ mydumpers:
     threads: 4
     chunk-filesize: 0
     skip-tz-utc: true
-    extra-args: "-B load_interrupt --statement-size=100"
+    extra-args: "--statement-size=100"
 
 loaders:
   global:
@@ -47,4 +41,3 @@ syncers:
   global:
     worker-count: 16
     batch: 100
-    max-retry: 100

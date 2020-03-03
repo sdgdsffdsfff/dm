@@ -15,6 +15,7 @@ package master
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/pingcap/errors"
 	"github.com/spf13/cobra"
@@ -26,8 +27,8 @@ import (
 // NewResumeRelayCmd creates a ResumeRelay command
 func NewResumeRelayCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "resume-relay <-w worker ...>",
-		Short: "resume dm-worker's relay unit",
+		Use:   "resume-relay <-s source ...>",
+		Short: "resume DM-worker's relay unit",
 		Run:   resumeRelayFunc,
 	}
 	return cmd
@@ -36,21 +37,22 @@ func NewResumeRelayCmd() *cobra.Command {
 // resumeRelayFunc does resume relay request
 func resumeRelayFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) > 0 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 
-	workers, err := common.GetWorkerArgs(cmd)
+	sources, err := common.GetSourceArgs(cmd)
 	if err != nil {
 		common.PrintLines("%s", errors.ErrorStack(err))
 		return
 	}
-	if len(workers) == 0 {
-		fmt.Println("must specify at least one dm-worker (`-w` / `--worker`)")
+	if len(sources) == 0 {
+		fmt.Println("must specify at least one source (`-s` / `--source`)")
 		return
 	}
 
-	resp, err := common.OperateRelay(pb.RelayOp_ResumeRelay, workers)
+	resp, err := common.OperateRelay(pb.RelayOp_ResumeRelay, sources)
 	if err != nil {
 		common.PrintLines("can not resume relay unit:\n%v", errors.ErrorStack(err))
 		return

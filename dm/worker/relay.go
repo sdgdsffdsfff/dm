@@ -21,11 +21,15 @@ import (
 	"github.com/siddontang/go/sync2"
 	"go.uber.org/zap"
 
+	"github.com/pingcap/dm/dm/config"
 	"github.com/pingcap/dm/dm/pb"
+	"github.com/pingcap/dm/dm/unit"
 	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dm/pkg/streamer"
+	"github.com/pingcap/dm/pkg/terror"
 	"github.com/pingcap/dm/relay"
 	"github.com/pingcap/dm/relay/purger"
+	rr "github.com/pingcap/dm/relay/retry"
 )
 
 // RelayHolder for relay unit
@@ -49,7 +53,7 @@ type RelayHolder interface {
 	// Result returns the result of the relay
 	Result() *pb.ProcessResult
 	// Update updates relay config online
-	Update(ctx context.Context, cfg *Config) error
+	Update(ctx context.Context, cfg *config.SourceConfig) error
 	// Migrate resets binlog name and binlog position for relay unit
 	Migrate(ctx context.Context, binlogName string, binlogPos uint32) error
 }
@@ -64,7 +68,7 @@ type realRelayHolder struct {
 	wg sync.WaitGroup
 
 	relay relay.Process
-	cfg   *Config
+	cfg   *config.SourceConfig
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -77,7 +81,7 @@ type realRelayHolder struct {
 }
 
 // NewRealRelayHolder creates a new RelayHolder
-func NewRealRelayHolder(cfg *Config) RelayHolder {
+func NewRealRelayHolder(cfg *config.SourceConfig) RelayHolder {
 	clone, _ := cfg.DecryptPassword()
 	relayCfg := &relay.Config{
 		EnableGTID:  clone.EnableGTID,
@@ -94,6 +98,13 @@ func NewRealRelayHolder(cfg *Config) RelayHolder {
 		},
 		BinLogName: clone.RelayBinLogName,
 		BinlogGTID: clone.RelayBinlogGTID,
+		ReaderRetry: rr.ReaderRetryConfig{ // we use config from TaskChecker now
+			BackoffRollback: cfg.Checker.BackoffRollback.Duration,
+			BackoffMax:      cfg.Checker.BackoffMax.Duration,
+			BackoffMin:      cfg.Checker.BackoffMin.Duration,
+			BackoffJitter:   cfg.Checker.BackoffJitter,
+			BackoffFactor:   cfg.Checker.BackoffFactor,
+		},
 	}
 
 	h := &realRelayHolder{
@@ -116,8 +127,10 @@ func (h *realRelayHolder) Init(interceptors []purger.PurgeInterceptor) (purger.P
 		streamer.GetReaderHub(),
 	}
 
-	if err := h.relay.Init(); err != nil {
-		return nil, errors.Annotate(err, "initial relay unit")
+	ctx, cancel := context.WithTimeout(context.Background(), unit.DefaultInitTimeout)
+	defer cancel()
+	if err := h.relay.Init(ctx); err != nil {
+		return nil, terror.Annotate(err, "initial relay unit")
 	}
 
 	return purger.NewPurger(h.cfg.Purge, h.cfg.RelayDir, operators, interceptors), nil
@@ -197,9 +210,9 @@ func (h *realRelayHolder) SwitchMaster(ctx context.Context, req *pb.SwitchRelayM
 	h.RLock()
 	defer h.RUnlock()
 	if h.stage != pb.Stage_Paused {
-		return errors.Errorf("current stage is %s, Paused required", h.stage.String())
+		return terror.ErrWorkerRelayStageNotValid.Generate(h.stage, pb.Stage_Paused, "switch master")
 	}
-	return errors.Trace(h.relay.SwitchMaster(ctx, req))
+	return h.relay.SwitchMaster(ctx, req)
 }
 
 // Operate operates relay unit
@@ -212,14 +225,14 @@ func (h *realRelayHolder) Operate(ctx context.Context, req *pb.OperateRelayReque
 	case pb.RelayOp_StopRelay:
 		return h.stopRelay(ctx, req)
 	}
-	return errors.NotSupportedf("operation %s", req.Op.String())
+	return terror.ErrWorkerRelayOperNotSupport.Generate(req.Op.String())
 }
 
 func (h *realRelayHolder) pauseRelay(ctx context.Context, req *pb.OperateRelayRequest) error {
 	h.Lock()
 	if h.stage != pb.Stage_Running {
 		h.Unlock()
-		return errors.Errorf("current stage is %s, Running required", h.stage.String())
+		return terror.ErrWorkerRelayStageNotValid.Generate(h.stage, pb.Stage_Running, req.Op)
 	}
 	h.stage = pb.Stage_Paused
 
@@ -238,7 +251,7 @@ func (h *realRelayHolder) resumeRelay(ctx context.Context, req *pb.OperateRelayR
 	h.Lock()
 	defer h.Unlock()
 	if h.stage != pb.Stage_Paused {
-		return errors.Errorf("current stage is %s, Paused required", h.stage.String())
+		return terror.ErrWorkerRelayStageNotValid.Generate(h.stage, pb.Stage_Paused, req.Op)
 	}
 
 	h.wg.Add(1)
@@ -253,7 +266,7 @@ func (h *realRelayHolder) stopRelay(ctx context.Context, req *pb.OperateRelayReq
 	h.Lock()
 	defer h.Unlock()
 	if h.stage == pb.Stage_Stopped {
-		return errors.NotValidf("current stage is already stopped")
+		return terror.ErrWorkerRelayStageNotValid.Generatef("current stage is already stopped not valid, relayop %s", req.Op)
 	}
 	h.stage = pb.Stage_Stopped
 
@@ -298,18 +311,17 @@ func (h *realRelayHolder) setResult(result *pb.ProcessResult) {
 }
 
 // Result returns the result of the relay
+// Note this method will omit the `Error` field in `pb.ProcessError`, so no duplicated
+// error message information will be displayed in `query-status`, as the `Msg` field
+// contains enough error information.
 func (h *realRelayHolder) Result() *pb.ProcessResult {
 	h.RLock()
 	defer h.RUnlock()
-	if h.result == nil {
-		return nil
-	}
-	clone := *h.result
-	return &clone
+	return statusProcessResult(h.result)
 }
 
 // Update update relay config online
-func (h *realRelayHolder) Update(ctx context.Context, cfg *Config) error {
+func (h *realRelayHolder) Update(ctx context.Context, cfg *config.SourceConfig) error {
 	relayCfg := &relay.Config{
 		AutoFixGTID: cfg.AutoFixGTID,
 		Charset:     cfg.Charset,
@@ -319,6 +331,13 @@ func (h *realRelayHolder) Update(ctx context.Context, cfg *Config) error {
 			User:     cfg.From.User,
 			Password: cfg.From.Password,
 		},
+		ReaderRetry: rr.ReaderRetryConfig{ // we use config from TaskChecker now
+			BackoffRollback: cfg.Checker.BackoffRollback.Duration,
+			BackoffMax:      cfg.Checker.BackoffMax.Duration,
+			BackoffMin:      cfg.Checker.BackoffMin.Duration,
+			BackoffJitter:   cfg.Checker.BackoffJitter,
+			BackoffFactor:   cfg.Checker.BackoffFactor,
+		},
 	}
 
 	stage := h.Stage()
@@ -326,22 +345,22 @@ func (h *realRelayHolder) Update(ctx context.Context, cfg *Config) error {
 	if stage == pb.Stage_Paused {
 		err := h.relay.Reload(relayCfg)
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 	} else if stage == pb.Stage_Running {
 		err := h.Operate(ctx, &pb.OperateRelayRequest{Op: pb.RelayOp_PauseRelay})
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 
 		err = h.relay.Reload(relayCfg)
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 
 		err = h.Operate(ctx, &pb.OperateRelayRequest{Op: pb.RelayOp_ResumeRelay})
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 	}
 
@@ -363,20 +382,23 @@ func (h *realRelayHolder) Migrate(ctx context.Context, binlogName string, binlog
 /******************** dummy relay holder ********************/
 
 type dummyRelayHolder struct {
+	sync.RWMutex
 	initError error
+	stage     pb.Stage
 
-	cfg *Config
+	cfg *config.SourceConfig
 }
 
 // NewDummyRelayHolder creates a new RelayHolder
-func NewDummyRelayHolder(cfg *Config) RelayHolder {
+func NewDummyRelayHolder(cfg *config.SourceConfig) RelayHolder {
 	return &dummyRelayHolder{
-		cfg: cfg,
+		cfg:   cfg,
+		stage: pb.Stage_New,
 	}
 }
 
 // NewDummyRelayHolderWithInitError creates a new RelayHolder with init error
-func NewDummyRelayHolderWithInitError(cfg *Config) RelayHolder {
+func NewDummyRelayHolderWithInitError(cfg *config.SourceConfig) RelayHolder {
 	return &dummyRelayHolder{
 		initError: errors.New("init error"),
 		cfg:       cfg,
@@ -394,14 +416,24 @@ func (d *dummyRelayHolder) Init(interceptors []purger.PurgeInterceptor) (purger.
 }
 
 // Start implements interface of RelayHolder
-func (d *dummyRelayHolder) Start() {}
+func (d *dummyRelayHolder) Start() {
+	d.Lock()
+	defer d.Unlock()
+	d.stage = pb.Stage_Running
+}
 
 // Close implements interface of RelayHolder
-func (d *dummyRelayHolder) Close() {}
+func (d *dummyRelayHolder) Close() {
+	d.Lock()
+	defer d.Unlock()
+	d.stage = pb.Stage_Stopped
+}
 
 // Status implements interface of RelayHolder
 func (d *dummyRelayHolder) Status() *pb.RelayStatus {
-	return nil
+	d.Lock()
+	defer d.Unlock()
+	return &pb.RelayStatus{Stage: d.stage}
 }
 
 // Error implements interface of RelayHolder
@@ -416,6 +448,25 @@ func (d *dummyRelayHolder) SwitchMaster(ctx context.Context, req *pb.SwitchRelay
 
 // Operate implements interface of RelayHolder
 func (d *dummyRelayHolder) Operate(ctx context.Context, req *pb.OperateRelayRequest) error {
+	d.Lock()
+	defer d.Unlock()
+	switch req.Op {
+	case pb.RelayOp_PauseRelay:
+		if d.stage != pb.Stage_Running {
+			return terror.ErrWorkerRelayStageNotValid.Generate(d.stage, pb.Stage_Running, req.Op)
+		}
+		d.stage = pb.Stage_Paused
+	case pb.RelayOp_ResumeRelay:
+		if d.stage != pb.Stage_Paused {
+			return terror.ErrWorkerRelayStageNotValid.Generate(d.stage, pb.Stage_Paused, req.Op)
+		}
+		d.stage = pb.Stage_Running
+	case pb.RelayOp_StopRelay:
+		if d.stage == pb.Stage_Stopped {
+			return terror.ErrWorkerRelayStageNotValid.Generatef("current stage is already stopped not valid, relayop %s", req.Op)
+		}
+		d.stage = pb.Stage_Stopped
+	}
 	return nil
 }
 
@@ -425,7 +476,7 @@ func (d *dummyRelayHolder) Result() *pb.ProcessResult {
 }
 
 // Update implements interface of RelayHolder
-func (d *dummyRelayHolder) Update(ctx context.Context, cfg *Config) error {
+func (d *dummyRelayHolder) Update(ctx context.Context, cfg *config.SourceConfig) error {
 	return nil
 }
 
@@ -439,5 +490,7 @@ func (d *dummyRelayHolder) EarliestActiveRelayLog() *streamer.RelayLogInfo {
 }
 
 func (d *dummyRelayHolder) Stage() pb.Stage {
-	return pb.Stage_Running
+	d.Lock()
+	defer d.Unlock()
+	return d.stage
 }

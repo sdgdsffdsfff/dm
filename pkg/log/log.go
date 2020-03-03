@@ -14,12 +14,18 @@
 package log
 
 import (
+	"context"
 	"fmt"
+	"strings"
 
+	"github.com/pingcap/errors"
 	pclog "github.com/pingcap/log"
 	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/pingcap/dm/pkg/helper"
+	"github.com/pingcap/dm/pkg/terror"
 )
 
 const (
@@ -69,32 +75,58 @@ func (l Logger) WithFields(fields ...zap.Field) Logger {
 	return Logger{l.With(fields...)}
 }
 
+// ErrorFilterContextCanceled wraps Logger.Error() and will filter error log when error is context.Canceled
+func (l Logger) ErrorFilterContextCanceled(msg string, fields ...zap.Field) {
+	for _, field := range fields {
+		switch field.Type {
+		case zapcore.StringType:
+			if field.Key == "error" && strings.Contains(field.String, context.Canceled.Error()) {
+				return
+			}
+		case zapcore.ErrorType:
+			err, ok := field.Interface.(error)
+			if ok && errors.Cause(err) == context.Canceled {
+				return
+			}
+		}
+	}
+	l.Logger.WithOptions(zap.AddCallerSkip(1)).Error(msg, fields...)
+}
+
 // logger for DM
 var (
 	appLogger = Logger{zap.NewNop()}
 	appLevel  zap.AtomicLevel
+	appProps  *pclog.ZapProperties
 )
 
 // InitLogger initializes DM's and also the TiDB library's loggers.
 func InitLogger(cfg *Config) error {
-	logutil.InitLogger(&logutil.LogConfig{Config: pclog.Config{Level: cfg.Level}})
+	err := logutil.InitLogger(&logutil.LogConfig{Config: pclog.Config{Level: cfg.Level}})
+	if err != nil {
+		return terror.ErrInitLoggerFail.Delegate(err)
+	}
 
 	logger, props, err := pclog.InitLogger(&pclog.Config{
 		Level: cfg.Level,
 		File: pclog.FileLogConfig{
 			Filename:   cfg.File,
-			LogRotate:  true,
 			MaxSize:    cfg.FileMaxSize,
 			MaxDays:    cfg.FileMaxDays,
 			MaxBackups: cfg.FileMaxBackups,
 		},
 	})
+	if err != nil {
+		return terror.ErrInitLoggerFail.Delegate(err)
+	}
+
 	// Do not log stack traces at all, as we'll get the stack trace from the
 	// error itself.
 	appLogger = Logger{logger.WithOptions(zap.AddStacktrace(zap.DPanicLevel))}
 	appLevel = props.Level
+	appProps = props
 
-	return err
+	return nil
 }
 
 // With creates a child logger from the global logger and adds structured
@@ -130,11 +162,16 @@ func L() Logger {
 	return appLogger
 }
 
+// Props returns the current logger's props.
+func Props() *pclog.ZapProperties {
+	return appProps
+}
+
 // WrapStringerField returns a wrap stringer field
 func WrapStringerField(message string, object fmt.Stringer) zap.Field {
-	if object != nil {
-		return zap.Stringer(message, object)
+	if helper.IsNil(object) {
+		return zap.String(message, "NULL")
 	}
 
-	return zap.String(message, "NULL")
+	return zap.Stringer(message, object)
 }

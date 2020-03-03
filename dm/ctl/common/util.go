@@ -14,6 +14,7 @@
 package common
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"strings"
@@ -74,6 +75,16 @@ func PrettyPrintResponse(resp proto.Message) {
 		PrintLines(errors.ErrorStack(err))
 	} else {
 		fmt.Println(s)
+	}
+}
+
+// PrettyPrintInterface prints an interface through encoding/json prettily
+func PrettyPrintInterface(resp interface{}) {
+	s, err := json.MarshalIndent(resp, "", "    ")
+	if err != nil {
+		PrintLines(errors.ErrorStack(err))
+	} else {
+		fmt.Println(string(s))
 	}
 }
 
@@ -154,9 +165,9 @@ func GetFileContent(fpath string) ([]byte, error) {
 	return content, nil
 }
 
-// GetWorkerArgs extracts workers from cmd
-func GetWorkerArgs(cmd *cobra.Command) ([]string, error) {
-	return cmd.Flags().GetStringSlice("worker")
+// GetSourceArgs extracts sources from cmd
+func GetSourceArgs(cmd *cobra.Command) ([]string, error) {
+	return cmd.Flags().GetStringSlice("source")
 }
 
 // ExtractSQLsFromArgs extract multiple sql from args.

@@ -23,9 +23,6 @@ function usage_and_arg_test() {
     # todo: no sense to fix
     #migrate_relay_while_master_down
 
-    refresh_worker_tasks_wrong_arg
-    refresh_worker_tasks_while_master_down
-
     switch_relay_master_wrong_arg
     switch_relay_master_without_worker
     switch_relay_master_while_master_down
@@ -62,13 +59,10 @@ function run() {
     usage_and_arg_test
 }
 
-cleanup1 dmctl_advance
+cleanup_data dmctl_advance
 # also cleanup dm processes in case of last run failed
-cleanup2 $*
+cleanup_process $*
 run $*
-cleanup2 $*
-
-wait_process_exit dm-master.test
-wait_process_exit dm-worker.test
+cleanup_process $*
 
 echo "[$(date)] <<<<<< test case $TEST_NAME success! >>>>>>"

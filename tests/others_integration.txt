@@ -1,3 +1,5 @@
-all_mode
-sequence_sharding
-sequence_safe_mode
+ha
+ha_master
+full_mode
+start_task
+dm_syncer

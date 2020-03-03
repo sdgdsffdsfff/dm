@@ -4,7 +4,7 @@ task-mode: all
 is-sharding: true
 meta-schema: "dm_meta"
 remove-meta: false
-enable-heartbeat: true
+# enable-heartbeat: true
 timezone: "Asia/Shanghai"
 
 target-database:
@@ -71,7 +71,7 @@ mydumpers:
     threads: 4
     chunk-filesize: 64
     skip-tz-utc: true
-    extra-args: "--regex '^sharding.*'"
+    extra-args: ""
 
 loaders:
   global:
@@ -82,4 +82,3 @@ syncers:
   global:
     worker-count: 16
     batch: 100
-    max-retry: 100

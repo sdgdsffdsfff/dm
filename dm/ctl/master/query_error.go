@@ -15,7 +15,7 @@ package master
 
 import (
 	"context"
-	"fmt"
+	"os"
 
 	"github.com/pingcap/dm/dm/ctl/common"
 	"github.com/pingcap/dm/dm/pb"
@@ -27,8 +27,8 @@ import (
 // NewQueryErrorCmd creates a QueryError command
 func NewQueryErrorCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "query-error [-w worker ...] [task_name]",
-		Short: "query task's error",
+		Use:   "query-error [-s source ...] [task-name]",
+		Short: "query task error",
 		Run:   queryErrorFunc,
 	}
 	return cmd
@@ -37,12 +37,13 @@ func NewQueryErrorCmd() *cobra.Command {
 // queryErrorFunc does query task's error
 func queryErrorFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) > 1 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 	taskName := cmd.Flags().Arg(0) // maybe empty
 
-	workers, err := common.GetWorkerArgs(cmd)
+	sources, err := common.GetSourceArgs(cmd)
 	if err != nil {
 		common.PrintLines("%s", errors.ErrorStack(err))
 		return
@@ -53,15 +54,15 @@ func queryErrorFunc(cmd *cobra.Command, _ []string) {
 	cli := common.MasterClient()
 	resp, err := cli.QueryError(ctx, &pb.QueryErrorListRequest{
 		Name:    taskName,
-		Workers: workers,
+		Sources: sources,
 	})
 	if err != nil {
 		common.PrintLines("dmctl query error failed")
 		if taskName != "" {
 			common.PrintLines("taskname: %s", taskName)
 		}
-		if len(workers) > 0 {
-			common.PrintLines("workers: %v", workers)
+		if len(sources) > 0 {
+			common.PrintLines("sources: %v", sources)
 		}
 		common.PrintLines("error: %s", errors.ErrorStack(err))
 		return

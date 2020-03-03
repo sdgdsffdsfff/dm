@@ -15,7 +15,8 @@ package master
 
 import (
 	"context"
-	"fmt"
+	"os"
+	"strings"
 
 	"github.com/pingcap/dm/dm/ctl/common"
 	"github.com/pingcap/dm/dm/pb"
@@ -24,11 +25,25 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const stageError = "Error"
+
+type taskResult struct {
+	Result bool        `json:"result"`
+	Msg    string      `json:"msg"`
+	Tasks  []*taskInfo `json:"tasks"`
+}
+
+type taskInfo struct {
+	TaskName   string   `json:"taskName,omitempty"`
+	TaskStatus string   `json:"taskStatus,omitempty"`
+	Sources    []string `json:"sources,omitempty"`
+}
+
 // NewQueryStatusCmd creates a QueryStatus command
 func NewQueryStatusCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "query-status [-w worker ...] [task_name]",
-		Short: "query task's status",
+		Use:   "query-status [-s source ...] [task-name]",
+		Short: "query task status",
 		Run:   queryStatusFunc,
 	}
 	return cmd
@@ -37,12 +52,13 @@ func NewQueryStatusCmd() *cobra.Command {
 // queryStatusFunc does query task's status
 func queryStatusFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) > 1 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 	taskName := cmd.Flags().Arg(0) // maybe empty
 
-	workers, err := common.GetWorkerArgs(cmd)
+	sources, err := common.GetSourceArgs(cmd)
 	if err != nil {
 		common.PrintLines("%s", errors.ErrorStack(err))
 		return
@@ -53,12 +69,85 @@ func queryStatusFunc(cmd *cobra.Command, _ []string) {
 	defer cancel()
 	resp, err := cli.QueryStatus(ctx, &pb.QueryStatusListRequest{
 		Name:    taskName,
-		Workers: workers,
+		Sources: sources,
 	})
 	if err != nil {
-		common.PrintLines("can not query %s task's status(in workers %v):\n%s", taskName, workers, errors.ErrorStack(err))
+		common.PrintLines("can not query %s task's status(in sources %v):\n%s", taskName, sources, errors.ErrorStack(err))
 		return
 	}
 
-	common.PrettyPrintResponse(resp)
+	if resp.Result && taskName == "" && len(sources) == 0 {
+		result := wrapTaskResult(resp)
+		common.PrettyPrintInterface(result)
+	} else {
+		common.PrettyPrintResponse(resp)
+	}
+}
+
+// errorOccurred checks ProcessResult and return true if some error occurred
+func errorOccurred(result *pb.ProcessResult) bool {
+	return result != nil && len(result.Errors) > 0
+}
+
+// getRelayStage returns current relay stage (including stageError)
+func getRelayStage(relayStatus *pb.RelayStatus) string {
+	if errorOccurred(relayStatus.Result) {
+		return stageError
+	}
+	return relayStatus.Stage.String()
+}
+
+// wrapTaskResult picks task info and generate tasks' status and relative workers
+func wrapTaskResult(resp *pb.QueryStatusListResponse) *taskResult {
+	taskStatusMap := make(map[string]string)
+	taskCorrespondingSources := make(map[string][]string)
+	for _, source := range resp.Sources {
+		relayStatus := source.SourceStatus.RelayStatus
+		for _, subTask := range source.SubTaskStatus {
+			subTaskName := subTask.Name
+			subTaskStage := subTask.Stage
+
+			taskCorrespondingSources[subTaskName] = append(taskCorrespondingSources[subTaskName], source.SourceStatus.Source)
+			taskStage := taskStatusMap[subTaskName]
+			// the status of a task is decided by its subtasks, the rule is listed as follows:
+			// |                     Subtasks' status                       |                Task's status                 |
+			// | :--------------------------------------------------------: | :------------------------------------------: |
+			// |           Any Paused and len(result.errors) > 0            |    Error - Some error occurred in subtask    |
+			// | Any Running and unit is "Sync" and relay is Paused/Stopped | Error - Relay status is Error/Paused/Stopped |
+			// |              Any Paused but without error                  |                    Paused                    |
+			// |                        All New                             |                     New                      |
+			// |                      All Finished                          |                   Finished                   |
+			// |                      All Stopped                           |                   Stopped                    |
+			// |                         Others                             |                   Running                    |
+			switch {
+			case strings.HasPrefix(taskStage, stageError):
+			case subTaskStage == pb.Stage_Paused && errorOccurred(subTask.Result):
+				taskStatusMap[subTaskName] = stageError + " - Some error occurred in subtask"
+			case subTask.Unit == pb.UnitType_Sync && subTask.Stage == pb.Stage_Running && relayStatus != nil && (relayStatus.Stage == pb.Stage_Paused || relayStatus.Stage == pb.Stage_Stopped):
+				taskStatusMap[subTaskName] = stageError + " - Relay status is " + getRelayStage(relayStatus)
+			case taskStage == pb.Stage_Paused.String():
+			case taskStage == "", subTaskStage == pb.Stage_Paused:
+				taskStatusMap[subTaskName] = subTaskStage.String()
+			case taskStage != subTaskStage.String():
+				taskStatusMap[subTaskName] = pb.Stage_Running.String()
+			}
+		}
+	}
+	taskList := make([]*taskInfo, 0, len(taskStatusMap))
+	for curTaskName, taskStatus := range taskStatusMap {
+		if strings.HasPrefix(taskStatus, stageError) {
+			taskStatus += ". Please run `query-status " + curTaskName + "` to get more details."
+		}
+		taskList = append(taskList,
+			&taskInfo{
+				TaskName:   curTaskName,
+				TaskStatus: taskStatus,
+				Sources:    taskCorrespondingSources[curTaskName],
+			})
+	}
+	return &taskResult{
+		Result: resp.Result,
+		Msg:    resp.Msg,
+		Tasks:  taskList,
+	}
 }

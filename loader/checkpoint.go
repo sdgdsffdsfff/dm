@@ -20,9 +20,11 @@ import (
 	"time"
 
 	"github.com/pingcap/dm/dm/config"
+	"github.com/pingcap/dm/pkg/conn"
 	tcontext "github.com/pingcap/dm/pkg/context"
+	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/terror"
 
-	"github.com/pingcap/errors"
 	"go.uber.org/zap"
 )
 
@@ -31,7 +33,7 @@ type CheckPoint interface {
 	// Load loads all checkpoints recorded before.
 	// because of no checkpoints updated in memory when error occurred
 	// when resuming, Load will be called again to load checkpoints
-	Load() error
+	Load(tctx *tcontext.Context) error
 
 	// GetRestoringFileInfo get restoring data files for table
 	GetRestoringFileInfo(db, table string) map[string][]int64
@@ -46,77 +48,81 @@ type CheckPoint interface {
 	CalcProgress(allFiles map[string]Tables2DataFiles) error
 
 	// Init initialize checkpoint data in tidb
-	Init(filename string, endpos int64) error
+	Init(tctx *tcontext.Context, filename string, endpos int64) error
+
+	// ResetConn resets database connections owned by the Checkpoint
+	ResetConn(tctx *tcontext.Context) error
 
 	// Close closes the CheckPoint
 	Close()
 
 	// Clear clears all recorded checkpoints
-	Clear() error
+	Clear(tctx *tcontext.Context) error
 
 	// Count returns recorded checkpoints' count
-	Count() (int, error)
+	Count(tctx *tcontext.Context) (int, error)
 
 	// GenSQL generates sql to update checkpoint to DB
 	GenSQL(filename string, offset int64) string
 }
 
 // RemoteCheckPoint implements CheckPoint by saving status in remote database system, mostly in TiDB.
+// it's not thread-safe
 type RemoteCheckPoint struct {
-	conn           *Conn // NOTE: use dbutil in tidb-tools later
+	db             *conn.BaseDB
+	conn           *DBConn
 	id             string
 	schema         string
 	table          string
 	restoringFiles map[string]map[string]FilePosSet
 	finishedTables map[string]struct{}
-	tctx           *tcontext.Context
+	logCtx         *tcontext.Context
 }
 
 func newRemoteCheckPoint(tctx *tcontext.Context, cfg *config.SubTaskConfig, id string) (CheckPoint, error) {
-	conn, err := createConn(cfg)
+	db, dbConns, err := createConns(tctx, cfg, 1)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
-	newtctx := tctx.WithLogger(tctx.L().WithFields(zap.String("component", "remote checkpoint")))
-
 	cp := &RemoteCheckPoint{
-		conn:           conn,
+		db:             db,
+		conn:           dbConns[0],
 		id:             id,
 		restoringFiles: make(map[string]map[string]FilePosSet),
 		finishedTables: make(map[string]struct{}),
 		schema:         cfg.MetaSchema,
 		table:          fmt.Sprintf("%s_loader_checkpoint", cfg.Name),
-		tctx:           newtctx,
+		logCtx:         tcontext.Background().WithLogger(tctx.L().WithFields(zap.String("component", "remote checkpoint"))),
 	}
 
-	err = cp.prepare()
+	err = cp.prepare(tctx)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	return cp, nil
 }
 
-func (cp *RemoteCheckPoint) prepare() error {
+func (cp *RemoteCheckPoint) prepare(tctx *tcontext.Context) error {
 	// create schema
-	if err := cp.createSchema(); err != nil {
-		return errors.Trace(err)
+	if err := cp.createSchema(tctx); err != nil {
+		return err
 	}
 	// create table
-	if err := cp.createTable(); err != nil {
-		return errors.Trace(err)
+	if err := cp.createTable(tctx); err != nil {
+		return err
 	}
 	return nil
 }
 
-func (cp *RemoteCheckPoint) createSchema() error {
+func (cp *RemoteCheckPoint) createSchema(tctx *tcontext.Context) error {
 	sql2 := fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS `%s`", cp.schema)
-	err := cp.conn.executeSQL(cp.tctx, []string{sql2}, true)
-	return errors.Trace(err)
+	err := cp.conn.executeSQL(tctx, []string{sql2})
+	return terror.WithScope(err, terror.ScopeDownstream)
 }
 
-func (cp *RemoteCheckPoint) createTable() error {
+func (cp *RemoteCheckPoint) createTable(tctx *tcontext.Context) error {
 	tableName := fmt.Sprintf("`%s`.`%s`", cp.schema, cp.table)
 	createTable := `CREATE TABLE IF NOT EXISTS %s (
 		id char(32) NOT NULL,
@@ -131,21 +137,21 @@ func (cp *RemoteCheckPoint) createTable() error {
 	);
 `
 	sql2 := fmt.Sprintf(createTable, tableName)
-	err := cp.conn.executeSQL(cp.tctx, []string{sql2}, true)
-	return errors.Trace(err)
+	err := cp.conn.executeSQL(tctx, []string{sql2})
+	return terror.WithScope(err, terror.ScopeDownstream)
 }
 
 // Load implements CheckPoint.Load
-func (cp *RemoteCheckPoint) Load() error {
+func (cp *RemoteCheckPoint) Load(tctx *tcontext.Context) error {
 	begin := time.Now()
 	defer func() {
-		cp.tctx.L().Info("load checkpoint", zap.Duration("cost time", time.Since(begin)))
+		cp.logCtx.L().Info("load checkpoint", zap.Duration("cost time", time.Since(begin)))
 	}()
 
 	query := fmt.Sprintf("SELECT `filename`,`cp_schema`,`cp_table`,`offset`,`end_pos` from `%s`.`%s` where `id`=?", cp.schema, cp.table)
-	rows, err := cp.conn.querySQL(cp.tctx, query, queryRetryCount, cp.id)
+	rows, err := cp.conn.querySQL(tctx, query, cp.id)
 	if err != nil {
-		return errors.Trace(err)
+		return terror.WithScope(err, terror.ScopeDownstream)
 	}
 	defer rows.Close()
 
@@ -161,7 +167,7 @@ func (cp *RemoteCheckPoint) Load() error {
 	for rows.Next() {
 		err := rows.Scan(&filename, &schema, &table, &offset, &endPos)
 		if err != nil {
-			return errors.Trace(err)
+			return terror.WithScope(terror.DBErrorAdapt(err, terror.ErrDBDriverError), terror.ScopeDownstream)
 		}
 
 		if _, ok := cp.restoringFiles[schema]; !ok {
@@ -175,7 +181,7 @@ func (cp *RemoteCheckPoint) Load() error {
 		restoringFiles[filename] = []int64{offset, endPos}
 	}
 
-	return errors.Trace(rows.Err())
+	return terror.WithScope(terror.DBErrorAdapt(rows.Err(), terror.ErrDBDriverError), terror.ScopeDownstream)
 }
 
 // GetRestoringFileInfo implements CheckPoint.GetRestoringFileInfo
@@ -216,13 +222,13 @@ func (cp *RemoteCheckPoint) CalcProgress(allFiles map[string]Tables2DataFiles) e
 	for db, tables := range cp.restoringFiles {
 		dbTables, ok := allFiles[db]
 		if !ok {
-			return errors.Errorf("db (%s) not exist in data files, but in checkpoint.", db)
+			return terror.ErrCheckpointDBNotExistInFile.Generate(db)
 		}
 
 		for table, restoringFiles := range tables {
 			files, ok := dbTables[table]
 			if !ok {
-				return errors.Errorf("table (%s) not exist in db (%s) in data files, but in checkpoint", table, db)
+				return terror.ErrCheckpointTableNotExistInFile.Generate(table, db)
 			}
 
 			restoringCount := len(restoringFiles)
@@ -235,19 +241,19 @@ func (cp *RemoteCheckPoint) CalcProgress(allFiles map[string]Tables2DataFiles) e
 					cp.finishedTables[t] = struct{}{}
 				}
 			} else if restoringCount > totalCount {
-				return errors.Errorf("restoring count greater than total count for table[%v]", table)
+				return terror.ErrCheckpointRestoreCountGreater.Generate(table)
 			}
 		}
 	}
 
-	cp.tctx.L().Info("calculate checkpoint finished.", zap.Reflect("finished tables", cp.finishedTables))
+	cp.logCtx.L().Info("calculate checkpoint finished.", zap.Reflect("finished tables", cp.finishedTables))
 	return nil
 }
 
 func (cp *RemoteCheckPoint) allFilesFinished(files map[string][]int64) bool {
 	for file, pos := range files {
 		if len(pos) != 2 {
-			cp.tctx.L().Error("unexpected checkpoint record", zap.String("data file", file), zap.Int64s("position", pos))
+			cp.logCtx.L().Error("unexpected checkpoint record", zap.String("data file", file), zap.Int64s("position", pos))
 			return false
 		}
 		if pos[0] != pos[1] {
@@ -258,20 +264,20 @@ func (cp *RemoteCheckPoint) allFilesFinished(files map[string][]int64) bool {
 }
 
 // Init implements CheckPoint.Init
-func (cp *RemoteCheckPoint) Init(filename string, endPos int64) error {
+func (cp *RemoteCheckPoint) Init(tctx *tcontext.Context, filename string, endPos int64) error {
 	idx := strings.Index(filename, ".sql")
 	if idx < 0 {
-		return errors.Errorf("invalid db table sql file - %s", filename)
+		return terror.ErrCheckpointInvalidTableFile.Generate(filename)
 	}
 	fname := filename[:idx]
 	fields := strings.Split(fname, ".")
 	if len(fields) != 2 && len(fields) != 3 {
-		return errors.Errorf("invalid db table sql file - %s", filename)
+		return terror.ErrCheckpointInvalidTableFile.Generate(filename)
 	}
 
 	// fields[0] -> db name, fields[1] -> table name
 	sql2 := fmt.Sprintf("INSERT INTO `%s`.`%s` (`id`, `filename`, `cp_schema`, `cp_table`, `offset`, `end_pos`) VALUES(?,?,?,?,?,?)", cp.schema, cp.table)
-	cp.tctx.L().Debug("initial checkpoint record",
+	cp.logCtx.L().Debug("initial checkpoint record",
 		zap.String("sql", sql2),
 		zap.String("id", cp.id),
 		zap.String("filename", filename),
@@ -279,21 +285,29 @@ func (cp *RemoteCheckPoint) Init(filename string, endPos int64) error {
 		zap.String("table", fields[1]),
 		zap.Int64("offset", 0),
 		zap.Int64("end position", endPos))
-	err := cp.conn.executeSQL2(cp.tctx, sql2, maxRetryCount, cp.id, filename, fields[0], fields[1], 0, endPos)
+	args := []interface{}{cp.id, filename, fields[0], fields[1], 0, endPos}
+	err := cp.conn.executeSQL(tctx, []string{sql2}, args)
 	if err != nil {
 		if isErrDupEntry(err) {
-			cp.tctx.L().Info("checkpoint record already exists, skip it.", zap.String("id", cp.id), zap.String("filename", filename))
+			cp.logCtx.L().Info("checkpoint record already exists, skip it.", zap.String("id", cp.id), zap.String("filename", filename))
 			return nil
 		}
-		return errors.Annotate(err, "initialize checkpoint")
+		return terror.WithScope(terror.Annotate(err, "initialize checkpoint"), terror.ScopeDownstream)
 	}
+	return nil
+}
 
-	return errors.Trace(err)
+// ResetConn implements CheckPoint.ResetConn
+func (cp *RemoteCheckPoint) ResetConn(tctx *tcontext.Context) error {
+	return cp.conn.resetConn(tctx)
 }
 
 // Close implements CheckPoint.Close
 func (cp *RemoteCheckPoint) Close() {
-	closeConn(cp.conn)
+	err := cp.db.Close()
+	if err != nil {
+		cp.logCtx.L().Error("close checkpoint db", log.ShortError(err))
+	}
 }
 
 // GenSQL implements CheckPoint.GenSQL
@@ -304,36 +318,41 @@ func (cp *RemoteCheckPoint) GenSQL(filename string, offset int64) string {
 }
 
 // Clear implements CheckPoint.Clear
-func (cp *RemoteCheckPoint) Clear() error {
+func (cp *RemoteCheckPoint) Clear(tctx *tcontext.Context) error {
 	sql2 := fmt.Sprintf("DELETE FROM `%s`.`%s` WHERE `id` = '%s'", cp.schema, cp.table, cp.id)
-	err := cp.conn.executeSQL(cp.tctx, []string{sql2}, true)
-	return errors.Trace(err)
+	err := cp.conn.executeSQL(tctx, []string{sql2})
+	return terror.WithScope(err, terror.ScopeDownstream)
 }
 
 // Count implements CheckPoint.Count
-func (cp *RemoteCheckPoint) Count() (int, error) {
+func (cp *RemoteCheckPoint) Count(tctx *tcontext.Context) (int, error) {
 	query := fmt.Sprintf("SELECT COUNT(id) FROM `%s`.`%s` WHERE `id` = ?", cp.schema, cp.table)
-	rows, err := cp.conn.querySQL(cp.tctx, query, queryRetryCount, cp.id)
+	rows, err := cp.conn.querySQL(tctx, query, cp.id)
 	if err != nil {
-		return 0, errors.Trace(err)
+		return 0, terror.WithScope(err, terror.ScopeDownstream)
 	}
 	defer rows.Close()
 	var count = 0
 	for rows.Next() {
 		err = rows.Scan(&count)
 		if err != nil {
-			return 0, errors.Trace(err)
+			return 0, terror.WithScope(terror.DBErrorAdapt(err, terror.ErrDBDriverError), terror.ScopeDownstream)
 		}
 	}
 	if rows.Err() != nil {
-		return 0, errors.Trace(rows.Err())
+		return 0, terror.WithScope(terror.DBErrorAdapt(rows.Err(), terror.ErrDBDriverError), terror.ScopeDownstream)
 	}
-	cp.tctx.L().Debug("checkpoint record", zap.Int("count", count))
+	cp.logCtx.L().Debug("checkpoint record", zap.Int("count", count))
 	return count, nil
 }
 
 func (cp *RemoteCheckPoint) String() string {
-	if err := cp.Load(); err != nil {
+	// `String` is often used to log something, it's not a big problem even fail,
+	// so 1min should be enough.
+	tctx2, cancel := cp.logCtx.WithTimeout(time.Minute)
+	defer cancel()
+
+	if err := cp.Load(tctx2); err != nil {
 		return err.Error()
 	}
 

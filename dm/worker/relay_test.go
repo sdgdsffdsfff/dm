@@ -22,6 +22,7 @@ import (
 
 	"github.com/pingcap/dm/dm/config"
 	"github.com/pingcap/dm/dm/pb"
+	"github.com/pingcap/dm/dm/unit"
 	pkgstreamer "github.com/pingcap/dm/pkg/streamer"
 	"github.com/pingcap/dm/pkg/utils"
 	"github.com/pingcap/dm/relay"
@@ -49,7 +50,7 @@ func NewDummyRelay(cfg *relay.Config) relay.Process {
 }
 
 // Init implements Process interface
-func (d *DummyRelay) Init() error {
+func (d *DummyRelay) Init(ctx context.Context) error {
 	return d.initErr
 }
 
@@ -133,14 +134,13 @@ func (t *testRelay) TestRelay(c *C) {
 		purger.NewPurger = originNewPurger
 	}()
 
-	cfg := NewConfig()
-	c.Assert(cfg.Parse([]string{"-config=./dm-worker.toml"}), IsNil)
+	cfg := loadSourceConfigWithoutPassword(c)
 
 	dir := c.MkDir()
 	cfg.RelayDir = dir
 	cfg.MetaDir = dir
 
-	relayHolder := NewRealRelayHolder(cfg)
+	relayHolder := NewRealRelayHolder(&cfg)
 	c.Assert(relayHolder, NotNil)
 
 	holder, ok := relayHolder.(*realRelayHolder)
@@ -179,7 +179,7 @@ func (t *testRelay) testStart(c *C, holder *realRelayHolder) {
 	c.Assert(holder.closed.Get(), Equals, closedFalse)
 
 	// test switch
-	c.Assert(holder.SwitchMaster(context.Background(), nil), ErrorMatches, "current stage is Running.*")
+	c.Assert(holder.SwitchMaster(context.Background(), nil), ErrorMatches, ".*current stage is Running.*")
 
 	// test status
 	status := holder.Status()
@@ -206,9 +206,7 @@ func (t *testRelay) testClose(c *C, holder *realRelayHolder) {
 	processResult := &pb.ProcessResult{
 		IsCanceled: true,
 		Errors: []*pb.ProcessError{
-			{
-				Msg: "process error",
-			},
+			unit.NewProcessError(pb.ErrorType_UnknownError, errors.New("process error")),
 		},
 	}
 	r.InjectProcessResult(*processResult)
@@ -240,7 +238,7 @@ func (t *testRelay) testPauseAndResume(c *C, holder *realRelayHolder) {
 	c.Assert(holder.closed.Get(), Equals, closedFalse)
 
 	err = holder.pauseRelay(context.Background(), &pb.OperateRelayRequest{Op: pb.RelayOp_PauseRelay})
-	c.Assert(err, ErrorMatches, "current stage is Paused.*")
+	c.Assert(err, ErrorMatches, ".*current stage is Paused.*")
 
 	// test status
 	status := holder.Status()
@@ -259,7 +257,7 @@ func (t *testRelay) testPauseAndResume(c *C, holder *realRelayHolder) {
 	c.Assert(holder.closed.Get(), Equals, closedFalse)
 
 	err = holder.Operate(context.Background(), &pb.OperateRelayRequest{Op: pb.RelayOp_ResumeRelay})
-	c.Assert(err, ErrorMatches, "current stage is Running.*")
+	c.Assert(err, ErrorMatches, ".*current stage is Running.*")
 
 	// test status
 	status = holder.Status()
@@ -272,7 +270,7 @@ func (t *testRelay) testPauseAndResume(c *C, holder *realRelayHolder) {
 }
 
 func (t *testRelay) testUpdate(c *C, holder *realRelayHolder) {
-	cfg := &Config{
+	cfg := &config.SourceConfig{
 		From: config.DBConfig{
 			Host:     "127.0.0.1",
 			Port:     3306,

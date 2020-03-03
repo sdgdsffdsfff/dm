@@ -7,6 +7,7 @@ import (
 	fmt "fmt"
 	io "io"
 	math "math"
+	math_bits "math/bits"
 
 	proto "github.com/gogo/protobuf/proto"
 )
@@ -20,7 +21,7 @@ var _ = math.Inf
 // is compatible with the proto package it is being compiled against.
 // A compilation error at this line likely means your copy of the
 // proto package needs to be updated.
-const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
+const _ = proto.GoGoProtoPackageIsVersion3 // please upgrade the proto package
 
 type TraceType int32
 
@@ -73,7 +74,7 @@ func (m *BaseEvent) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 		return xxx_messageInfo_BaseEvent.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
-		n, err := m.MarshalTo(b)
+		n, err := m.MarshalToSizedBuffer(b)
 		if err != nil {
 			return nil, err
 		}
@@ -164,7 +165,7 @@ var fileDescriptor_be09eaf025e7bb5c = []byte{
 func (m *BaseEvent) Marshal() (dAtA []byte, err error) {
 	size := m.Size()
 	dAtA = make([]byte, size)
-	n, err := m.MarshalTo(dAtA)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
 		return nil, err
 	}
@@ -172,54 +173,64 @@ func (m *BaseEvent) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *BaseEvent) MarshalTo(dAtA []byte) (int, error) {
-	var i int
+	size := m.Size()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *BaseEvent) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
 	_ = i
 	var l int
 	_ = l
-	if len(m.Filename) > 0 {
-		dAtA[i] = 0xa
-		i++
-		i = encodeVarintTracerBase(dAtA, i, uint64(len(m.Filename)))
-		i += copy(dAtA[i:], m.Filename)
-	}
-	if m.Line != 0 {
-		dAtA[i] = 0x10
-		i++
-		i = encodeVarintTracerBase(dAtA, i, uint64(m.Line))
-	}
-	if m.Tso != 0 {
-		dAtA[i] = 0x18
-		i++
-		i = encodeVarintTracerBase(dAtA, i, uint64(m.Tso))
-	}
-	if len(m.TraceID) > 0 {
-		dAtA[i] = 0x22
-		i++
-		i = encodeVarintTracerBase(dAtA, i, uint64(len(m.TraceID)))
-		i += copy(dAtA[i:], m.TraceID)
+	if m.Type != 0 {
+		i = encodeVarintTracerBase(dAtA, i, uint64(m.Type))
+		i--
+		dAtA[i] = 0x30
 	}
 	if len(m.GroupID) > 0 {
-		dAtA[i] = 0x2a
-		i++
+		i -= len(m.GroupID)
+		copy(dAtA[i:], m.GroupID)
 		i = encodeVarintTracerBase(dAtA, i, uint64(len(m.GroupID)))
-		i += copy(dAtA[i:], m.GroupID)
+		i--
+		dAtA[i] = 0x2a
 	}
-	if m.Type != 0 {
-		dAtA[i] = 0x30
-		i++
-		i = encodeVarintTracerBase(dAtA, i, uint64(m.Type))
+	if len(m.TraceID) > 0 {
+		i -= len(m.TraceID)
+		copy(dAtA[i:], m.TraceID)
+		i = encodeVarintTracerBase(dAtA, i, uint64(len(m.TraceID)))
+		i--
+		dAtA[i] = 0x22
 	}
-	return i, nil
+	if m.Tso != 0 {
+		i = encodeVarintTracerBase(dAtA, i, uint64(m.Tso))
+		i--
+		dAtA[i] = 0x18
+	}
+	if m.Line != 0 {
+		i = encodeVarintTracerBase(dAtA, i, uint64(m.Line))
+		i--
+		dAtA[i] = 0x10
+	}
+	if len(m.Filename) > 0 {
+		i -= len(m.Filename)
+		copy(dAtA[i:], m.Filename)
+		i = encodeVarintTracerBase(dAtA, i, uint64(len(m.Filename)))
+		i--
+		dAtA[i] = 0xa
+	}
+	return len(dAtA) - i, nil
 }
 
 func encodeVarintTracerBase(dAtA []byte, offset int, v uint64) int {
+	offset -= sovTracerBase(v)
+	base := offset
 	for v >= 1<<7 {
 		dAtA[offset] = uint8(v&0x7f | 0x80)
 		v >>= 7
 		offset++
 	}
 	dAtA[offset] = uint8(v)
-	return offset + 1
+	return base
 }
 func (m *BaseEvent) Size() (n int) {
 	if m == nil {
@@ -252,14 +263,7 @@ func (m *BaseEvent) Size() (n int) {
 }
 
 func sovTracerBase(x uint64) (n int) {
-	for {
-		n++
-		x >>= 7
-		if x == 0 {
-			break
-		}
-	}
-	return n
+	return (math_bits.Len64(x|1) + 6) / 7
 }
 func sozTracerBase(x uint64) (n int) {
 	return sovTracerBase(uint64((x << 1) ^ uint64((int64(x) >> 63))))
@@ -473,6 +477,7 @@ func (m *BaseEvent) Unmarshal(dAtA []byte) error {
 func skipTracerBase(dAtA []byte) (n int, err error) {
 	l := len(dAtA)
 	iNdEx := 0
+	depth := 0
 	for iNdEx < l {
 		var wire uint64
 		for shift := uint(0); ; shift += 7 {
@@ -504,10 +509,8 @@ func skipTracerBase(dAtA []byte) (n int, err error) {
 					break
 				}
 			}
-			return iNdEx, nil
 		case 1:
 			iNdEx += 8
-			return iNdEx, nil
 		case 2:
 			var length int
 			for shift := uint(0); ; shift += 7 {
@@ -528,55 +531,30 @@ func skipTracerBase(dAtA []byte) (n int, err error) {
 				return 0, ErrInvalidLengthTracerBase
 			}
 			iNdEx += length
-			if iNdEx < 0 {
-				return 0, ErrInvalidLengthTracerBase
-			}
-			return iNdEx, nil
 		case 3:
-			for {
-				var innerWire uint64
-				var start int = iNdEx
-				for shift := uint(0); ; shift += 7 {
-					if shift >= 64 {
-						return 0, ErrIntOverflowTracerBase
-					}
-					if iNdEx >= l {
-						return 0, io.ErrUnexpectedEOF
-					}
-					b := dAtA[iNdEx]
-					iNdEx++
-					innerWire |= (uint64(b) & 0x7F) << shift
-					if b < 0x80 {
-						break
-					}
-				}
-				innerWireType := int(innerWire & 0x7)
-				if innerWireType == 4 {
-					break
-				}
-				next, err := skipTracerBase(dAtA[start:])
-				if err != nil {
-					return 0, err
-				}
-				iNdEx = start + next
-				if iNdEx < 0 {
-					return 0, ErrInvalidLengthTracerBase
-				}
-			}
-			return iNdEx, nil
+			depth++
 		case 4:
-			return iNdEx, nil
+			if depth == 0 {
+				return 0, ErrUnexpectedEndOfGroupTracerBase
+			}
+			depth--
 		case 5:
 			iNdEx += 4
-			return iNdEx, nil
 		default:
 			return 0, fmt.Errorf("proto: illegal wireType %d", wireType)
 		}
+		if iNdEx < 0 {
+			return 0, ErrInvalidLengthTracerBase
+		}
+		if depth == 0 {
+			return iNdEx, nil
+		}
 	}
-	panic("unreachable")
+	return 0, io.ErrUnexpectedEOF
 }
 
 var (
-	ErrInvalidLengthTracerBase = fmt.Errorf("proto: negative length found during unmarshaling")
-	ErrIntOverflowTracerBase   = fmt.Errorf("proto: integer overflow")
+	ErrInvalidLengthTracerBase        = fmt.Errorf("proto: negative length found during unmarshaling")
+	ErrIntOverflowTracerBase          = fmt.Errorf("proto: integer overflow")
+	ErrUnexpectedEndOfGroupTracerBase = fmt.Errorf("proto: unexpected end of group")
 )

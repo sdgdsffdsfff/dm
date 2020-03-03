@@ -15,205 +15,205 @@ package loader
 
 import (
 	"database/sql"
-	"fmt"
+	"strconv"
+	"strings"
 	"time"
-
-	"github.com/pingcap/dm/dm/config"
-	tcontext "github.com/pingcap/dm/pkg/context"
-	"github.com/pingcap/dm/pkg/log"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	tmysql "github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"go.uber.org/zap"
+
+	"github.com/pingcap/dm/dm/config"
+	"github.com/pingcap/dm/pkg/conn"
+	tcontext "github.com/pingcap/dm/pkg/context"
+	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/retry"
+	"github.com/pingcap/dm/pkg/terror"
+	"github.com/pingcap/dm/pkg/utils"
 )
 
-// Conn represents a live DB connection
-type Conn struct {
-	cfg *config.SubTaskConfig
+// DBConn represents a live DB connection
+// it's not thread-safe
+type DBConn struct {
+	cfg      *config.SubTaskConfig
+	baseConn *conn.BaseConn
 
-	db *sql.DB
+	// generate new BaseConn and close old one
+	resetBaseConnFn func(*tcontext.Context, *conn.BaseConn) (*conn.BaseConn, error)
 }
 
-func (conn *Conn) querySQL(ctx *tcontext.Context, query string, maxRetry int, args ...interface{}) (*sql.Rows, error) {
-	if conn == nil || conn.db == nil {
-		return nil, errors.NotValidf("database connection")
+func (conn *DBConn) querySQL(ctx *tcontext.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	if conn == nil || conn.baseConn == nil {
+		return nil, terror.ErrDBUnExpect.Generate("database connection not valid")
 	}
 
-	var (
-		err  error
-		rows *sql.Rows
-	)
-
-	ctx.L().Debug("query statement", zap.String("sql", query), zap.Reflect("arguments", args))
-	startTime := time.Now()
-	defer func() {
-		if err == nil {
-			cost := time.Since(startTime)
-			queryHistogram.WithLabelValues(conn.cfg.Name).Observe(cost.Seconds())
-			if cost > 1 {
-				ctx.L().Warn("query statement", zap.String("sql", query), zap.Reflect("arguments", args), zap.Duration("cost time", cost))
+	params := retry.Params{
+		RetryCount:         10,
+		FirstRetryDuration: time.Second,
+		BackoffStrategy:    retry.Stable,
+		IsRetryableFn: func(retryTime int, err error) bool {
+			if retry.IsConnectionError(err) {
+				err = conn.resetConn(ctx)
+				if err != nil {
+					ctx.L().Error("reset connection failed", zap.Int("retry", retryTime),
+						zap.String("query", utils.TruncateInterface(query, -1)),
+						zap.String("arguments", utils.TruncateInterface(args, -1)),
+						log.ShortError(err))
+					return false
+				}
+				return true
 			}
-		}
-	}()
-
-	for i := 0; i < maxRetry; i++ {
-		if i > 0 {
-			time.Sleep(time.Duration(i) * time.Second)
-			ctx.L().Warn("query statement", zap.Int("retry", i), zap.String("sql", query), zap.Reflect("arguments", args))
-		}
-		rows, err = conn.db.QueryContext(ctx.Context(), query, args...)
-		if err != nil {
-			if isRetryableError(err) {
-				ctx.L().Warn("query statement", zap.Int("retry", i), zap.String("sql", query), zap.Reflect("arguments", args), log.ShortError(err))
-				continue
+			if dbutil.IsRetryableError(err) {
+				ctx.L().Warn("query statement", zap.Int("retry", retryTime),
+					zap.String("query", utils.TruncateString(query, -1)),
+					zap.String("argument", utils.TruncateInterface(args, -1)),
+					log.ShortError(err))
+				return true
 			}
-			return nil, errors.Trace(err)
-		}
-		return rows, nil
-	}
-	return nil, errors.Annotatef(err, "query statement, sql [%s] args [%v] failed", query, args)
-}
-
-func (conn *Conn) executeSQL2(ctx *tcontext.Context, stmt string, maxRetry int, args ...interface{}) error {
-	if conn == nil || conn.db == nil {
-		return errors.NotValidf("database connection")
+			return false
+		},
 	}
 
-	var err error
-	for i := 0; i < maxRetry; i++ {
-		if i > 0 {
-			ctx.L().Warn("execute statement", zap.Int("retry", i), zap.String("sql", stmt), zap.Reflect("arguments", args))
-			time.Sleep(time.Duration(i) * time.Second)
-		}
-		_, err = conn.db.ExecContext(ctx.Context(), stmt, args...)
-		if err != nil {
-			if isRetryableError(err) {
-				ctx.L().Warn("execute statement", zap.Int("retry", i), zap.String("sql", stmt), zap.Reflect("arguments", args), log.ShortError(err))
-				continue
+	ret, _, err := conn.baseConn.ApplyRetryStrategy(
+		ctx,
+		params,
+		func(ctx *tcontext.Context) (interface{}, error) {
+			startTime := time.Now()
+			ret, err := conn.baseConn.QuerySQL(ctx, query, args...)
+			if err == nil {
+				cost := time.Since(startTime)
+				queryHistogram.WithLabelValues(conn.cfg.Name).Observe(cost.Seconds())
+				if cost.Seconds() > 1 {
+					ctx.L().Warn("query statement",
+						zap.String("query", utils.TruncateString(query, -1)),
+						zap.String("argument", utils.TruncateInterface(args, -1)),
+						zap.Duration("cost time", cost))
+				}
 			}
-			return errors.Trace(err)
-		}
-		return nil
-	}
-	return errors.Annotatef(err, "exec sql[%s] args[%v] failed", stmt, args)
-}
-
-func (conn *Conn) executeSQL(ctx *tcontext.Context, sqls []string, enableRetry bool) error {
-	return conn.executeSQLCustomRetry(ctx, sqls, enableRetry, isRetryableError)
-}
-
-func (conn *Conn) executeDDL(ctx *tcontext.Context, sqls []string, enableRetry bool) error {
-	return conn.executeSQLCustomRetry(ctx, sqls, enableRetry, isDDLRetryableError)
-}
-
-func (conn *Conn) executeSQLCustomRetry(ctx *tcontext.Context, sqls []string, enableRetry bool, isRetryableFn func(err error) bool) error {
-	if len(sqls) == 0 {
-		return nil
-	}
-
-	if conn == nil || conn.db == nil {
-		return errors.NotValidf("database connection")
-	}
-
-	var err error
-
-	retryCount := 1
-	if enableRetry {
-		retryCount = maxRetryCount
-	}
-
-	for i := 0; i < retryCount; i++ {
-		if i > 0 {
-			ctx.L().Debug("execute statement", zap.Int("retry", i), zap.String("sqls", fmt.Sprintf("%-.200v", sqls)))
-			time.Sleep(2 * time.Duration(i) * time.Second)
-		}
-
-		startTime := time.Now()
-		err = executeSQLImp(ctx, conn.db, sqls)
-		if err != nil {
-			tidbExecutionErrorCounter.WithLabelValues(conn.cfg.Name).Inc()
-			if isRetryableFn(err) {
-				continue
-			}
-			return errors.Trace(err)
-		}
-
-		// update metrics
-		cost := time.Since(startTime)
-		txnHistogram.WithLabelValues(conn.cfg.Name).Observe(cost.Seconds())
-		if cost > 1 {
-			ctx.L().Warn("transaction execute successfully", zap.Duration("cost time", cost))
-		}
-
-		return nil
-	}
-
-	return errors.Trace(err)
-}
-
-func executeSQLImp(ctx *tcontext.Context, db *sql.DB, sqls []string) error {
-	var (
-		err error
-		txn *sql.Tx
-		res sql.Result
-	)
-
-	txn, err = db.Begin()
+			return ret, err
+		})
 	if err != nil {
-		ctx.L().Error("fail to begin a transaction", zap.String("sqls", fmt.Sprintf("%-.200v", sqls)), zap.Error(err))
+		ctx.L().ErrorFilterContextCanceled("query statement failed after retry",
+			zap.String("query", utils.TruncateString(query, -1)),
+			zap.String("argument", utils.TruncateInterface(args, -1)),
+			log.ShortError(err))
+		return nil, err
+	}
+	return ret.(*sql.Rows), nil
+}
+
+func (conn *DBConn) executeSQL(ctx *tcontext.Context, queries []string, args ...[]interface{}) error {
+	if len(queries) == 0 {
+		return nil
+	}
+
+	if conn == nil || conn.baseConn == nil {
+		return terror.ErrDBUnExpect.Generate("database connection not valid")
+	}
+
+	params := retry.Params{
+		RetryCount:         10,
+		FirstRetryDuration: 2 * time.Second,
+		BackoffStrategy:    retry.LinearIncrease,
+		IsRetryableFn: func(retryTime int, err error) bool {
+			tidbExecutionErrorCounter.WithLabelValues(conn.cfg.Name).Inc()
+			if retry.IsConnectionError(err) {
+				err = conn.resetConn(ctx)
+				if err != nil {
+					ctx.L().Error("reset connection failed", zap.Int("retry", retryTime),
+						zap.String("queries", utils.TruncateInterface(queries, -1)),
+						zap.String("arguments", utils.TruncateInterface(args, -1)),
+						log.ShortError(err))
+					return false
+				}
+				return true
+			}
+			if dbutil.IsRetryableError(err) {
+				ctx.L().Warn("execute statements", zap.Int("retry", retryTime),
+					zap.String("queries", utils.TruncateInterface(queries, -1)),
+					zap.String("arguments", utils.TruncateInterface(args, -1)),
+					log.ShortError(err))
+				return true
+			}
+			return false
+		},
+	}
+
+	_, _, err := conn.baseConn.ApplyRetryStrategy(
+		ctx,
+		params,
+		func(ctx *tcontext.Context) (interface{}, error) {
+			startTime := time.Now()
+			_, err := conn.baseConn.ExecuteSQL(ctx, queries, args...)
+			failpoint.Inject("LoadExecCreateTableFailed", func(val failpoint.Value) {
+				errCode, err1 := strconv.ParseUint(val.(string), 10, 16)
+				if err1 != nil {
+					ctx.L().Fatal("failpoint LoadExecCreateTableFailed's value is invalid", zap.String("val", val.(string)))
+				}
+
+				if len(queries) == 1 && strings.Contains(queries[0], "CREATE TABLE") {
+					err = &mysql.MySQLError{uint16(errCode), ""}
+					ctx.L().Warn("executeSQL failed", zap.String("failpoint", "LoadExecCreateTableFailed"), zap.Error(err))
+				}
+			})
+			if err == nil {
+				cost := time.Since(startTime)
+				txnHistogram.WithLabelValues(conn.cfg.Name).Observe(cost.Seconds())
+				if cost.Seconds() > 1 {
+					ctx.L().Warn("transaction execute successfully", zap.Duration("cost time", cost))
+				}
+			}
+			return nil, err
+		})
+
+	if err != nil {
+		ctx.L().ErrorFilterContextCanceled("execute statements failed after retry",
+			zap.String("queries", utils.TruncateInterface(queries, -1)),
+			zap.String("arguments", utils.TruncateInterface(args, -1)),
+			log.ShortError(err))
+	}
+
+	return err
+}
+
+// resetConn reset one worker connection from specify *BaseDB
+func (conn *DBConn) resetConn(tctx *tcontext.Context) error {
+	baseConn, err := conn.resetBaseConnFn(tctx, conn.baseConn)
+	if err != nil {
 		return err
 	}
-
-	for i := range sqls {
-		ctx.L().Debug("execute statement", zap.String("sqls", fmt.Sprintf("%-.200v", sqls[i])))
-		res, err = txn.ExecContext(ctx.Context(), sqls[i])
-		if err != nil {
-			ctx.L().Warn("execute statement", zap.String("sqls", fmt.Sprintf("%-.200v", sqls[i])), log.ShortError(err))
-			rerr := txn.Rollback()
-			if rerr != nil {
-				ctx.L().Error("fail rollback", log.ShortError(rerr))
-			}
-			return err
-		}
-		// check update checkpoint successful or not
-		if i == 2 {
-			row, err1 := res.RowsAffected()
-			if err1 != nil {
-				ctx.L().Warn("fail to get rows affected", zap.String("sqls", fmt.Sprintf("%-.200v", sqls[i])), log.ShortError(err1))
-				continue
-			}
-			if row != 1 {
-				ctx.L().Warn("update checkpoint", zap.Int64("affected rows", row))
-			}
-		}
-	}
-
-	err = txn.Commit()
-	if err != nil {
-		return errors.Trace(err)
-	}
-
+	conn.baseConn = baseConn
 	return nil
 }
 
-func createConn(cfg *config.SubTaskConfig) (*Conn, error) {
-	dbDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/?charset=utf8mb4&maxAllowedPacket=%d",
-		cfg.To.User, cfg.To.Password, cfg.To.Host, cfg.To.Port, *cfg.To.MaxAllowedPacket)
-	db, err := sql.Open("mysql", dbDSN)
+func createConns(tctx *tcontext.Context, cfg *config.SubTaskConfig, workerCount int) (*conn.BaseDB, []*DBConn, error) {
+	baseDB, err := conn.DefaultDBProvider.Apply(cfg.To)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, nil, terror.WithScope(err, terror.ScopeDownstream)
 	}
-
-	return &Conn{db: db, cfg: cfg}, nil
-}
-
-func closeConn(conn *Conn) error {
-	if conn.db == nil {
-		return nil
+	conns := make([]*DBConn, 0, workerCount)
+	for i := 0; i < workerCount; i++ {
+		baseConn, err := baseDB.GetBaseConn(tctx.Context())
+		if err != nil {
+			terr := baseDB.Close()
+			if terr != nil {
+				tctx.L().Error("failed to close baseDB", zap.Error(terr))
+			}
+			return nil, nil, terror.WithScope(err, terror.ScopeDownstream)
+		}
+		resetBaseConnFn := func(tctx *tcontext.Context, baseConn *conn.BaseConn) (*conn.BaseConn, error) {
+			err := baseDB.CloseBaseConn(baseConn)
+			if err != nil {
+				tctx.L().Warn("failed to close baseConn in reset")
+			}
+			return baseDB.GetBaseConn(tctx.Context())
+		}
+		conns = append(conns, &DBConn{baseConn: baseConn, cfg: cfg, resetBaseConnFn: resetBaseConnFn})
 	}
-
-	return errors.Trace(conn.db.Close())
+	return baseDB, conns, nil
 }
 
 func isErrDBExists(err error) bool {
@@ -226,24 +226,6 @@ func isErrTableExists(err error) bool {
 
 func isErrDupEntry(err error) bool {
 	return isMySQLError(err, tmysql.ErrDupEntry)
-}
-
-func isRetryableError(err error) bool {
-	err = errors.Cause(err)
-	if isMySQLError(err, tmysql.ErrDupEntry) {
-		return false
-	}
-	if isMySQLError(err, tmysql.ErrDataTooLong) {
-		return false
-	}
-	return true
-}
-
-func isDDLRetryableError(err error) bool {
-	if isErrTableExists(err) || isErrDBExists(err) {
-		return false
-	}
-	return isRetryableError(err)
 }
 
 func isMySQLError(err error, code uint16) bool {

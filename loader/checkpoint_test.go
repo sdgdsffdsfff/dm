@@ -76,26 +76,26 @@ func (t *testCheckPointSuite) TestForDB(c *C) {
 	c.Assert(err, IsNil)
 	defer cp.Close()
 
-	cp.Clear()
+	cp.Clear(tctx)
 
 	// no checkpoint exist
-	err = cp.Load()
+	err = cp.Load(tctx)
 	c.Assert(err, IsNil)
 
 	infos := cp.GetAllRestoringFileInfo()
 	c.Assert(len(infos), Equals, 0)
 
-	count, err := cp.Count()
+	count, err := cp.Count(tctx)
 	c.Assert(err, IsNil)
 	c.Assert(count, Equals, 0)
 
 	// insert default checkpoints
 	for _, cs := range cases {
-		err = cp.Init(cs.filename, cs.endPos)
+		err = cp.Init(tctx, cs.filename, cs.endPos)
 		c.Assert(err, IsNil)
 	}
 
-	err = cp.Load()
+	err = cp.Load(tctx)
 	c.Assert(err, IsNil)
 
 	infos = cp.GetAllRestoringFileInfo()
@@ -108,21 +108,25 @@ func (t *testCheckPointSuite) TestForDB(c *C) {
 		c.Assert(info[1], Equals, cs.endPos)
 	}
 
-	count, err = cp.Count()
+	count, err = cp.Count(tctx)
 	c.Assert(err, IsNil)
 	c.Assert(count, Equals, len(cases))
 
 	// update checkpoints
-	conn, err := createConn(t.cfg)
+	db, conns, err := createConns(tctx, t.cfg, 1)
 	c.Assert(err, IsNil)
-	defer closeConn(conn)
+	conn := conns[0]
+	defer func() {
+		err = db.Close()
+		c.Assert(err, IsNil)
+	}()
 	for _, cs := range cases {
 		sql2 := cp.GenSQL(cs.filename, cs.endPos)
-		err = conn.executeSQL(tctx, []string{sql2}, true)
+		err = conn.executeSQL(tctx, []string{sql2})
 		c.Assert(err, IsNil)
 	}
 
-	err = cp.Load()
+	err = cp.Load(tctx)
 	c.Assert(err, IsNil)
 
 	infos = cp.GetAllRestoringFileInfo()
@@ -135,22 +139,22 @@ func (t *testCheckPointSuite) TestForDB(c *C) {
 		c.Assert(info[1], Equals, cs.endPos)
 	}
 
-	count, err = cp.Count()
+	count, err = cp.Count(tctx)
 	c.Assert(err, IsNil)
 	c.Assert(count, Equals, len(cases))
 
 	// clear all
-	cp.Clear()
+	cp.Clear(tctx)
 
 	// no checkpoint exist
-	err = cp.Load()
+	err = cp.Load(tctx)
 	c.Assert(err, IsNil)
 
 	infos = cp.GetAllRestoringFileInfo()
 	c.Assert(len(infos), Equals, 0)
 
 	// obtain count again
-	count, err = cp.Count()
+	count, err = cp.Count(tctx)
 	c.Assert(err, IsNil)
 	c.Assert(count, Equals, 0)
 }

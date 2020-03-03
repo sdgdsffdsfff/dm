@@ -15,7 +15,7 @@ package master
 
 import (
 	"context"
-	"fmt"
+	"os"
 
 	"github.com/pingcap/errors"
 	"github.com/spf13/cobra"
@@ -28,8 +28,8 @@ import (
 // NewStartTaskCmd creates a StartTask command
 func NewStartTaskCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "start-task [-w worker ...] <config_file>",
-		Short: "start a task with config file",
+		Use:   "start-task [-s source ...] <config-file>",
+		Short: "start a task as defined in the config file",
 		Run:   startTaskFunc,
 	}
 	return cmd
@@ -38,7 +38,8 @@ func NewStartTaskCmd() *cobra.Command {
 // startTaskFunc does start task request
 func startTaskFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) != 1 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 	content, err := common.GetFileContent(cmd.Flags().Arg(0))
@@ -47,7 +48,7 @@ func startTaskFunc(cmd *cobra.Command, _ []string) {
 		return
 	}
 
-	workers, err := common.GetWorkerArgs(cmd)
+	sources, err := common.GetSourceArgs(cmd)
 	if err != nil {
 		common.PrintLines("%s", errors.ErrorStack(err))
 		return
@@ -60,7 +61,7 @@ func startTaskFunc(cmd *cobra.Command, _ []string) {
 	cli := common.MasterClient()
 	resp, err := cli.StartTask(ctx, &pb.StartTaskRequest{
 		Task:    string(content),
-		Workers: workers,
+		Sources: sources,
 	})
 	if err != nil {
 		common.PrintLines("can not start task:\n%v", errors.ErrorStack(err))

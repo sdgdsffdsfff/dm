@@ -20,11 +20,13 @@ import (
 	"time"
 
 	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/terror"
 
-	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
+	tmysql "github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/pkg/filter"
-	"github.com/pingcap/tidb-tools/pkg/table-router"
+	router "github.com/pingcap/tidb-tools/pkg/table-router"
 	"go.uber.org/zap"
 )
 
@@ -39,7 +41,7 @@ const (
 func ExtractTable(name string) (string, string, error) {
 	parts := strings.Split(name, "`.`")
 	if len(parts) != 2 {
-		return "", "", errors.NotValidf("table name %s", name)
+		return "", "", terror.ErrSchemaTableNameNotValid.Generate(name)
 	}
 
 	return strings.TrimLeft(parts[0], "`"), strings.TrimRight(parts[1], "`"), nil
@@ -61,8 +63,14 @@ func TrimCtrlChars(s string) string {
 // FetchAllDoTables returns all need to do tables after filtered (fetches from upstream MySQL)
 func FetchAllDoTables(db *sql.DB, bw *filter.Filter) (map[string][]string, error) {
 	schemas, err := getSchemas(db, maxRetryCount)
+
+	failpoint.Inject("FetchAllDoTablesFailed", func(val failpoint.Value) {
+		err = tmysql.NewErr(uint16(val.(int)))
+		log.L().Warn("FetchAllDoTables failed", zap.String("failpoint", "FetchAllDoTablesFailed"), zap.Error(err))
+	})
+
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, terror.WithScope(err, terror.ScopeUpstream)
 	}
 
 	ftSchemas := make([]*filter.Table, 0, len(schemas))
@@ -87,7 +95,7 @@ func FetchAllDoTables(db *sql.DB, bw *filter.Filter) (map[string][]string, error
 		// use `GetTables` from tidb-tools, no view included
 		tables, err := dbutil.GetTables(context.Background(), db, schema)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, terror.WithScope(terror.DBErrorAdapt(err, terror.ErrDBDriverError), terror.ScopeUpstream)
 		}
 		ftTables := make([]*filter.Table, 0, len(tables))
 		for _, table := range tables {
@@ -115,8 +123,14 @@ func FetchAllDoTables(db *sql.DB, bw *filter.Filter) (map[string][]string, error
 func FetchTargetDoTables(db *sql.DB, bw *filter.Filter, router *router.Table) (map[string][]*filter.Table, error) {
 	// fetch tables from source and filter them
 	sourceTables, err := FetchAllDoTables(db, bw)
+
+	failpoint.Inject("FetchTargetDoTablesFailed", func(val failpoint.Value) {
+		err = tmysql.NewErr(uint16(val.(int)))
+		log.L().Warn("FetchTargetDoTables failed", zap.String("failpoint", "FetchTargetDoTablesFailed"), zap.Error(err))
+	})
+
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	mapper := make(map[string][]*filter.Table)
@@ -124,7 +138,7 @@ func FetchTargetDoTables(db *sql.DB, bw *filter.Filter, router *router.Table) (m
 		for _, table := range tables {
 			targetSchema, targetTable, err := router.Route(schema, table)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, terror.ErrGenTableRouter.Delegate(err)
 			}
 
 			targetTableName := dbutil.TableName(targetSchema, targetTable)
@@ -142,7 +156,7 @@ func getSchemas(db *sql.DB, maxRetry int) ([]string, error) {
 	query := "SHOW DATABASES"
 	rows, err := querySQL(db, query, maxRetry)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -164,11 +178,11 @@ func getSchemas(db *sql.DB, maxRetry int) ([]string, error) {
 		var schema string
 		err = rows.Scan(&schema)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, terror.DBErrorAdapt(err, terror.ErrDBDriverError)
 		}
 		schemas = append(schemas, schema)
 	}
-	return schemas, errors.Trace(rows.Err())
+	return schemas, terror.DBErrorAdapt(rows.Err(), terror.ErrDBDriverError)
 }
 
 func querySQL(db *sql.DB, query string, maxRetry int) (*sql.Rows, error) {
@@ -179,27 +193,23 @@ func querySQL(db *sql.DB, query string, maxRetry int) (*sql.Rows, error) {
 
 	for i := 0; i < maxRetry; i++ {
 		if i > 0 {
-			log.L().Warn("query retry", zap.Int("retry number", i), zap.String("query", query))
+			log.L().Warn("query retry", zap.Int("retry number", i), zap.String("query", TruncateString(query, -1)))
 			time.Sleep(retryTimeout)
 		} else {
-			log.L().Debug("query sql", zap.String("query", query))
+			log.L().Debug("query sql", zap.String("query", TruncateString(query, -1)))
 		}
 
 		rows, err = db.Query(query)
 		if err != nil {
-			log.L().Warn("query retry", zap.String("query", query), log.ShortError(err))
+			log.L().Warn("query retry", zap.String("query", TruncateString(query, -1)), log.ShortError(err))
 			continue
 		}
 
 		return rows, nil
 	}
 
-	if err != nil {
-		log.L().Error("query failed", zap.String("query", query), zap.Error(err))
-		return nil, errors.Trace(err)
-	}
-
-	return nil, errors.Errorf("fail to query %s", query)
+	log.L().Error("query failed", zap.String("query", TruncateString(query, -1)), zap.Error(err))
+	return nil, terror.DBErrorAdapt(err, terror.ErrDBDriverError)
 }
 
 // CompareShardingDDLs compares s and t ddls

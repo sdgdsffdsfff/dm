@@ -14,14 +14,14 @@
 package syncer
 
 import (
-	"database/sql/driver"
-
 	"github.com/go-sql-driver/mysql"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
 	tmysql "github.com/pingcap/parser/mysql"
-	gmysql "github.com/siddontang/go-mysql/mysql"
 
+	"github.com/pingcap/dm/pkg/conn"
+	"github.com/pingcap/dm/pkg/context"
+	tcontext "github.com/pingcap/dm/pkg/context"
 	"github.com/pingcap/dm/pkg/utils"
 )
 
@@ -29,30 +29,6 @@ func newMysqlErr(number uint16, message string) *mysql.MySQLError {
 	return &mysql.MySQLError{
 		Number:  number,
 		Message: message,
-	}
-}
-
-func (s *testSyncerSuite) TestIsRetryableError(c *C) {
-	cases := []struct {
-		err         error
-		isRetryable bool
-	}{
-		{newMysqlErr(tmysql.ErrNoDB, "no db error"), false},
-		{errors.New("unknown error"), false},
-		{newMysqlErr(tmysql.ErrUnknown, "i/o timeout"), true},
-		{newMysqlErr(tmysql.ErrDBCreateExists, "db already exists"), false},
-		{driver.ErrBadConn, false},
-		{newMysqlErr(gmysql.ER_LOCK_DEADLOCK, "Deadlock found when trying to get lock; try restarting transaction"), true},
-		{newMysqlErr(tmysql.ErrPDServerTimeout, "pd server timeout"), true},
-		{newMysqlErr(tmysql.ErrTiKVServerTimeout, "tikv server timeout"), true},
-		{newMysqlErr(tmysql.ErrTiKVServerBusy, "tikv server busy"), true},
-		{newMysqlErr(tmysql.ErrResolveLockTimeout, "resolve lock timeout"), true},
-		{newMysqlErr(tmysql.ErrRegionUnavailable, "region unavailable"), true},
-	}
-
-	for _, t := range cases {
-		c.Logf("err %v, expected %v", t.err, t.isRetryable)
-		c.Assert(isRetryableError(t.err), Equals, t.isRetryable)
 	}
 }
 
@@ -90,4 +66,119 @@ func (s *testSyncerSuite) TestOriginError(c *C) {
 
 	err3 := errors.Trace(err2)
 	c.Assert(originError(err3), DeepEquals, err1)
+}
+
+func (s *testSyncerSuite) TestHandleSpecialDDLError(c *C) {
+	var (
+		syncer = NewSyncer(s.cfg, nil)
+		tctx   = tcontext.Background()
+		conn2  = &DBConn{resetBaseConnFn: func(*context.Context, *conn.BaseConn) (*conn.BaseConn, error) {
+			return nil, nil
+		}}
+		customErr     = errors.New("custom error")
+		invalidDDL    = "SQL CAN NOT BE PARSED"
+		insertDML     = "INSERT INTO tbl VALUES (1)"
+		createTable   = "CREATE TABLE tbl (col INT)"
+		addUK         = "ALTER TABLE tbl ADD UNIQUE INDEX idx(col)"
+		addFK         = "ALTER TABLE tbl ADD CONSTRAINT fk FOREIGN KEY (col) REFERENCES tbl2 (col)"
+		addColumn     = "ALTER TABLE tbl ADD COLUMN col INT"
+		addIndexMulti = "ALTER TABLE tbl ADD INDEX idx1(col1), ADD INDEX idx2(col2)"
+		addIndex1     = "ALTER TABLE tbl ADD INDEX idx(col)"
+		addIndex2     = "CREATE INDEX idx ON tbl(col)"
+		cases         = []struct {
+			err     error
+			ddls    []string
+			index   int
+			handled bool
+		}{
+			{
+				err: mysql.ErrInvalidConn, // empty DDLs
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{addColumn, addIndex1}, // error happen not on the last
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{addIndex1, addColumn}, // error happen not on the last
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{addIndex1, addIndex2}, // error happen not on the last
+			},
+			{
+				err:  customErr, // not `invalid connection`
+				ddls: []string{addIndex1},
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{invalidDDL}, // invalid DDL
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{insertDML}, // invalid DDL
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{createTable}, // not `ADD INDEX`
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{addColumn}, // not `ADD INDEX`
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{addUK}, // not `ADD INDEX`, but `ADD UNIQUE INDEX`
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{addFK}, // not `ADD INDEX`, but `ADD * FOREIGN KEY`
+			},
+			{
+				err:  mysql.ErrInvalidConn,
+				ddls: []string{addIndexMulti}, // multi `ADD INDEX` in one statement
+			},
+			{
+				err:     mysql.ErrInvalidConn,
+				ddls:    []string{addIndex1},
+				handled: true,
+			},
+			{
+				err:     mysql.ErrInvalidConn,
+				ddls:    []string{addIndex2},
+				handled: true,
+			},
+			{
+				err:     mysql.ErrInvalidConn,
+				ddls:    []string{addColumn, addIndex1},
+				index:   1,
+				handled: true,
+			},
+			{
+				err:     mysql.ErrInvalidConn,
+				ddls:    []string{addColumn, addIndex2},
+				index:   1,
+				handled: true,
+			},
+			{
+				err:     mysql.ErrInvalidConn,
+				ddls:    []string{addIndex1, addIndex2},
+				index:   1,
+				handled: true,
+			},
+		}
+	)
+
+	var err error
+	syncer.fromDB, err = createUpStreamConn(s.cfg.From) // used to get parser
+	c.Assert(err, IsNil)
+
+	for _, cs := range cases {
+		err2 := syncer.handleSpecialDDLError(tctx, cs.err, cs.ddls, cs.index, conn2)
+		if cs.handled {
+			c.Assert(err2, IsNil)
+		} else {
+			c.Assert(err2, Equals, cs.err)
+		}
+	}
 }

@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -26,12 +27,13 @@ import (
 	"github.com/pingcap/dm/dm/config"
 	"github.com/pingcap/dm/dm/pb"
 	"github.com/pingcap/dm/dm/unit"
+	"github.com/pingcap/dm/pkg/conn"
 	fr "github.com/pingcap/dm/pkg/func-rollback"
 	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/terror"
 	"github.com/pingcap/dm/pkg/utils"
 
 	_ "github.com/go-sql-driver/mysql" // for mysql
-	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb-tools/pkg/check"
 	column "github.com/pingcap/tidb-tools/pkg/column-mapping"
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
@@ -41,13 +43,21 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	// the total time needed to complete the check depends on the number of instances, databases and tables,
+	// now increase the total timeout to 30min, but set `readTimeout` to 30s for source/target DB.
+	// if we can not complete the check in 30min, then we must need to refactor the implementation of the function.
+	checkTimeout = 30 * time.Minute
+	readTimeout  = "30s"
+)
+
 type mysqlInstance struct {
 	cfg *config.SubTaskConfig
 
-	sourceDB     *sql.DB
+	sourceDB     *conn.BaseDB
 	sourceDBinfo *dbutil.DBConfig
 
-	targetDB     *sql.DB
+	targetDB     *conn.BaseDB
 	targetDBInfo *dbutil.DBConfig
 }
 
@@ -87,7 +97,7 @@ func NewChecker(cfgs []*config.SubTaskConfig, checkingItems map[string]string) *
 }
 
 // Init implements Unit interface
-func (c *Checker) Init() (err error) {
+func (c *Checker) Init(ctx context.Context) (err error) {
 	rollbackHolder := fr.NewRollbackHolder("checker")
 	defer func() {
 		if err != nil {
@@ -107,15 +117,18 @@ func (c *Checker) Init() (err error) {
 	_, checkSchema := c.checkingItems[config.TableSchemaChecking]
 
 	for _, instance := range c.instances {
-		bw := filter.New(instance.cfg.CaseSensitive, instance.cfg.BWList)
+		bw, err := filter.New(instance.cfg.CaseSensitive, instance.cfg.BWList)
+		if err != nil {
+			return terror.ErrTaskCheckGenBWList.Delegate(err)
+		}
 		r, err := router.NewTableRouter(instance.cfg.CaseSensitive, instance.cfg.RouteRules)
 		if err != nil {
-			return errors.Trace(err)
+			return terror.ErrTaskCheckGenTableRouter.Delegate(err)
 		}
 
 		columnMapping[instance.cfg.SourceID], err = column.NewMapping(instance.cfg.CaseSensitive, instance.cfg.ColumnMappingRules)
 		if err != nil {
-			return errors.Trace(err)
+			return terror.ErrTaskCheckGenColumnMapping.Delegate(err)
 		}
 
 		instance.sourceDBinfo = &dbutil.DBConfig{
@@ -124,9 +137,11 @@ func (c *Checker) Init() (err error) {
 			User:     instance.cfg.From.User,
 			Password: instance.cfg.From.Password,
 		}
-		instance.sourceDB, err = dbutil.OpenDB(*instance.sourceDBinfo)
+		dbCfg := instance.cfg.From
+		dbCfg.RawDBCfg = config.DefaultRawDBConfig().SetReadTimeout(readTimeout)
+		instance.sourceDB, err = conn.DefaultDBProvider.Apply(dbCfg)
 		if err != nil {
-			return errors.Annotatef(err, "failed to open source DSN %s:***@%s:%d", instance.cfg.From.User, instance.cfg.From.Host, instance.cfg.From.Port)
+			return terror.WithScope(terror.ErrTaskCheckFailedOpenDB.Delegate(err, instance.cfg.From.User, instance.cfg.From.Host, instance.cfg.From.Port), terror.ScopeUpstream)
 		}
 
 		instance.targetDBInfo = &dbutil.DBConfig{
@@ -135,42 +150,44 @@ func (c *Checker) Init() (err error) {
 			User:     instance.cfg.To.User,
 			Password: instance.cfg.To.Password,
 		}
-		instance.targetDB, err = dbutil.OpenDB(*instance.targetDBInfo)
+		dbCfg = instance.cfg.To
+		dbCfg.RawDBCfg = config.DefaultRawDBConfig().SetReadTimeout(readTimeout)
+		instance.targetDB, err = conn.DefaultDBProvider.Apply(dbCfg)
 		if err != nil {
-			return errors.Annotatef(err, "failed to open target DSN %s:***@%s:%d", instance.cfg.To.User, instance.cfg.To.Host, instance.cfg.To.Port)
+			return terror.WithScope(terror.ErrTaskCheckFailedOpenDB.Delegate(err, instance.cfg.To.User, instance.cfg.To.Host, instance.cfg.To.Port), terror.ScopeDownstream)
 		}
 
 		if _, ok := c.checkingItems[config.VersionChecking]; ok {
-			c.checkList = append(c.checkList, check.NewMySQLVersionChecker(instance.sourceDB, instance.sourceDBinfo))
+			c.checkList = append(c.checkList, check.NewMySQLVersionChecker(instance.sourceDB.DB, instance.sourceDBinfo))
 		}
 		if _, ok := c.checkingItems[config.BinlogEnableChecking]; ok {
-			c.checkList = append(c.checkList, check.NewMySQLBinlogEnableChecker(instance.sourceDB, instance.sourceDBinfo))
+			c.checkList = append(c.checkList, check.NewMySQLBinlogEnableChecker(instance.sourceDB.DB, instance.sourceDBinfo))
 		}
 		if _, ok := c.checkingItems[config.BinlogFormatChecking]; ok {
-			c.checkList = append(c.checkList, check.NewMySQLBinlogFormatChecker(instance.sourceDB, instance.sourceDBinfo))
+			c.checkList = append(c.checkList, check.NewMySQLBinlogFormatChecker(instance.sourceDB.DB, instance.sourceDBinfo))
 		}
 		if _, ok := c.checkingItems[config.BinlogRowImageChecking]; ok {
-			c.checkList = append(c.checkList, check.NewMySQLBinlogRowImageChecker(instance.sourceDB, instance.sourceDBinfo))
+			c.checkList = append(c.checkList, check.NewMySQLBinlogRowImageChecker(instance.sourceDB.DB, instance.sourceDBinfo))
 		}
 		if _, ok := c.checkingItems[config.DumpPrivilegeChecking]; ok {
-			c.checkList = append(c.checkList, check.NewSourceDumpPrivilegeChecker(instance.sourceDB, instance.sourceDBinfo))
+			c.checkList = append(c.checkList, check.NewSourceDumpPrivilegeChecker(instance.sourceDB.DB, instance.sourceDBinfo))
 		}
 		if _, ok := c.checkingItems[config.ReplicationPrivilegeChecking]; ok {
-			c.checkList = append(c.checkList, check.NewSourceReplicationPrivilegeChecker(instance.sourceDB, instance.sourceDBinfo))
+			c.checkList = append(c.checkList, check.NewSourceReplicationPrivilegeChecker(instance.sourceDB.DB, instance.sourceDBinfo))
 		}
 
 		if !checkingShard && !checkSchema {
 			continue
 		}
 
-		mapping, err := utils.FetchTargetDoTables(instance.sourceDB, bw, r)
+		mapping, err := utils.FetchTargetDoTables(instance.sourceDB.DB, bw, r)
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 
 		err = sameTableNameDetection(mapping)
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 
 		checkTables := make(map[string][]string)
@@ -191,10 +208,10 @@ func (c *Checker) Init() (err error) {
 				shardingCounter[name]++
 			}
 		}
-		dbs[instance.cfg.SourceID] = instance.sourceDB
+		dbs[instance.cfg.SourceID] = instance.sourceDB.DB
 
 		if checkSchema {
-			c.checkList = append(c.checkList, check.NewTablesChecker(instance.sourceDB, instance.sourceDBinfo, checkTables))
+			c.checkList = append(c.checkList, check.NewTablesChecker(instance.sourceDB.DB, instance.sourceDBinfo, checkTables))
 		}
 	}
 
@@ -228,16 +245,19 @@ func (c *Checker) displayCheckingItems() string {
 
 // Process implements Unit interface
 func (c *Checker) Process(ctx context.Context, pr chan pb.ProcessResult) {
-	cctx, cancel := context.WithTimeout(ctx, time.Minute)
+	cctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
 
 	isCanceled := false
 	errs := make([]*pb.ProcessError, 0, 1)
-	result, _ := check.Do(cctx, c.checkList)
-	if !result.Summary.Passed {
-		errs = append(errs, unit.NewProcessError(pb.ErrorType_CheckFailed, "check was failed, please see detail"))
-
+	result, err := check.Do(cctx, c.checkList)
+	if err != nil {
+		errs = append(errs, unit.NewProcessError(pb.ErrorType_CheckFailed, err))
+	} else if !result.Summary.Passed {
+		errs = append(errs, unit.NewProcessError(pb.ErrorType_CheckFailed, errors.New("check was failed, please see detail")))
 	}
+
+	c.updateInstruction(result)
 
 	select {
 	case <-cctx.Done():
@@ -261,6 +281,23 @@ func (c *Checker) Process(ctx context.Context, pr chan pb.ProcessResult) {
 	}
 }
 
+// updateInstruction updates the check result's Instruction
+func (c *Checker) updateInstruction(result *check.Results) {
+	for _, r := range result.Results {
+		if r.State == check.StateSuccess {
+			continue
+		}
+
+		// can't judge by other field, maybe update it later
+		switch r.Extra {
+		case check.AutoIncrementKeyChecking:
+			if strings.HasPrefix(r.Instruction, "please handle it by yourself") {
+				r.Instruction += ", read document https://pingcap.com/docs-cn/dev/reference/tools/data-migration/usage-scenarios/best-practice-dm-shard/#自增主键冲突处理 for more detail (only have Chinese document now, will translate to English later)"
+			}
+		}
+	}
+}
+
 // Close implements Unit interface
 func (c *Checker) Close() {
 	if c.closed.Get() {
@@ -275,14 +312,14 @@ func (c *Checker) Close() {
 func (c *Checker) closeDBs() {
 	for _, instance := range c.instances {
 		if instance.sourceDB != nil {
-			if err := dbutil.CloseDB(instance.sourceDB); err != nil {
+			if err := instance.sourceDB.Close(); err != nil {
 				c.logger.Error("close source db", zap.Stringer("db", instance.sourceDBinfo), log.ShortError(err))
 			}
 			instance.sourceDB = nil
 		}
 
 		if instance.targetDB != nil {
-			if err := dbutil.CloseDB(instance.targetDB); err != nil {
+			if err := instance.targetDB.Close(); err != nil {
 				c.logger.Error("close target db", zap.Stringer("db", instance.targetDBInfo), log.ShortError(err))
 			}
 			instance.targetDB = nil
@@ -349,6 +386,7 @@ func (c *Checker) Status() interface{} {
 func (c *Checker) Error() interface{} {
 	return &pb.CheckError{}
 }
+
 func sameTableNameDetection(tables map[string][]*filter.Table) error {
 	tableNameSets := make(map[string]string)
 	var messages []string
@@ -363,7 +401,7 @@ func sameTableNameDetection(tables map[string][]*filter.Table) error {
 	}
 
 	if len(messages) > 0 {
-		return errors.Errorf("same table name in case-sensitive %v", messages)
+		return terror.ErrTaskCheckSameTableName.Generate(messages)
 	}
 
 	return nil

@@ -15,7 +15,7 @@ package master
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"strings"
 
 	"github.com/pingcap/errors"
@@ -28,8 +28,8 @@ import (
 // NewSQLInjectCmd creates a SQLInject command
 func NewSQLInjectCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "sql-inject <-w worker> <task_name> <sql1;sql2;>",
-		Short: "sql-inject injects (limited) sqls into syncer as binlog event",
+		Use:   "sql-inject <-s source> <task-name> <sql1;sql2;>",
+		Short: "inject (limited) SQLs into binlog replication unit as binlog events",
 		Run:   sqlInjectFunc,
 	}
 	return cmd
@@ -38,23 +38,24 @@ func NewSQLInjectCmd() *cobra.Command {
 // sqlInjectFunc does sql inject request
 func sqlInjectFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) < 2 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 
-	workers, err := common.GetWorkerArgs(cmd)
+	sources, err := common.GetSourceArgs(cmd)
 	if err != nil {
 		common.PrintLines("%s", errors.ErrorStack(err))
 		return
 	}
-	if len(workers) != 1 {
-		common.PrintLines("want only one worker, but got %v", workers)
+	if len(sources) != 1 {
+		common.PrintLines("want only one source, but got %v", sources)
 		return
 	}
 
 	taskName := cmd.Flags().Arg(0)
 	if strings.TrimSpace(taskName) == "" {
-		common.PrintLines("task_name is empty")
+		common.PrintLines("task-name is empty")
 		return
 	}
 
@@ -83,7 +84,7 @@ func sqlInjectFunc(cmd *cobra.Command, _ []string) {
 		Name:   taskName,
 		Op:     pb.SQLOp_INJECT,
 		Args:   realSQLs,
-		Worker: workers[0],
+		Source: sources[0],
 	})
 	if err != nil {
 		common.PrintLines("can not inject sql:\n%v", errors.ErrorStack(err))

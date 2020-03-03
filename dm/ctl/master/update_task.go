@@ -15,7 +15,7 @@ package master
 
 import (
 	"context"
-	"fmt"
+	"os"
 
 	"github.com/pingcap/errors"
 	"github.com/spf13/cobra"
@@ -28,8 +28,8 @@ import (
 // NewUpdateTaskCmd creates a UpdateTask command
 func NewUpdateTaskCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "update-task [-w worker ...] <config_file>",
-		Short: "update a task's config for routes, filters, column-mappings, black-white-list",
+		Use:   "update-task [-s source ...] <config-file>",
+		Short: "update a task's config for routes, filters, or black-white-list",
 		Run:   updateTaskFunc,
 	}
 	return cmd
@@ -38,7 +38,8 @@ func NewUpdateTaskCmd() *cobra.Command {
 // updateTaskFunc does update task request
 func updateTaskFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) != 1 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 	content, err := common.GetFileContent(cmd.Flags().Arg(0))
@@ -47,7 +48,7 @@ func updateTaskFunc(cmd *cobra.Command, _ []string) {
 		return
 	}
 
-	workers, err := common.GetWorkerArgs(cmd)
+	sources, err := common.GetSourceArgs(cmd)
 	if err != nil {
 		common.PrintLines("%s", errors.ErrorStack(err))
 		return
@@ -60,7 +61,7 @@ func updateTaskFunc(cmd *cobra.Command, _ []string) {
 	cli := common.MasterClient()
 	resp, err := cli.UpdateTask(ctx, &pb.UpdateTaskRequest{
 		Task:    string(content),
-		Workers: workers,
+		Sources: sources,
 	})
 	if err != nil {
 		common.PrintLines("can not update task:\n%v", errors.ErrorStack(err))

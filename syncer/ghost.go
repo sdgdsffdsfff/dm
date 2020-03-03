@@ -16,13 +16,13 @@ package syncer
 import (
 	"strings"
 
-	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/dm/config"
 	tcontext "github.com/pingcap/dm/pkg/context"
+	"github.com/pingcap/dm/pkg/terror"
 )
 
 // Ghost handles gh-ost online ddls (not complete, don't need to review it)
@@ -35,21 +35,18 @@ type Ghost struct {
 
 // NewGhost returns gh-oat online plugin
 func NewGhost(tctx *tcontext.Context, cfg *config.SubTaskConfig) (OnlinePlugin, error) {
-
-	newtctx := tctx.WithLogger(tctx.L().WithFields(zap.String("online ddl", "gh-ost")))
-
 	g := &Ghost{
-		storge: NewOnlineDDLStorage(newtctx, cfg),
+		storge: NewOnlineDDLStorage(tcontext.Background().WithLogger(tctx.L().WithFields(zap.String("online ddl", "gh-ost"))), cfg),
 	}
 
-	return g, errors.Trace(g.storge.Init())
+	return g, g.storge.Init(tctx)
 }
 
 // Apply implements interface.
 // returns ddls, real schema, real table, error
-func (g *Ghost) Apply(tables []*filter.Table, statement string, stmt ast.StmtNode) ([]string, string, string, error) {
+func (g *Ghost) Apply(tctx *tcontext.Context, tables []*filter.Table, statement string, stmt ast.StmtNode) ([]string, string, string, error) {
 	if len(tables) < 1 {
-		return nil, "", "", errors.NotValidf("tables should not be empty!")
+		return nil, "", "", terror.ErrSyncerUnitGhostApplyEmptyTable.Generate()
 	}
 
 	schema, table := tables[0].Schema, tables[0].Name
@@ -61,14 +58,14 @@ func (g *Ghost) Apply(tables []*filter.Table, statement string, stmt ast.StmtNod
 		switch stmt.(type) {
 		case *ast.RenameTableStmt:
 			if len(tables) != 2 {
-				return nil, "", "", errors.NotValidf("tables should contain old and new table name")
+				return nil, "", "", terror.ErrSyncerUnitGhostRenameTableNotValid.Generate()
 			}
 
 			tp1 := g.TableType(tables[1].Name)
 			if tp1 == trashTable {
 				return nil, "", "", nil
 			} else if tp1 == ghostTable {
-				return nil, "", "", errors.NotSupportedf("rename table to ghost table %s", statement)
+				return nil, "", "", terror.ErrSyncerUnitGhostRenameToGhostTable.Generate(statement)
 			}
 		}
 		return []string{statement}, schema, table, nil
@@ -77,30 +74,30 @@ func (g *Ghost) Apply(tables []*filter.Table, statement string, stmt ast.StmtNod
 		switch stmt.(type) {
 		case *ast.RenameTableStmt:
 			if len(tables) != 2 {
-				return nil, "", "", errors.NotValidf("tables should contain old and new table name")
+				return nil, "", "", terror.ErrSyncerUnitGhostRenameTableNotValid.Generate()
 			}
 
 			tp1 := g.TableType(tables[1].Name)
 			if tp1 == ghostTable {
-				return nil, "", "", errors.NotSupportedf("rename ghost table to other ghost table %s", statement)
+				return nil, "", "", terror.ErrSyncerUnitGhostRenameGhostTblToOther.Generate(statement)
 			}
 		}
 	case ghostTable:
 		// record ghost table ddl changes
 		switch stmt.(type) {
 		case *ast.CreateTableStmt:
-			err := g.storge.Delete(schema, table)
+			err := g.storge.Delete(tctx, schema, table)
 			if err != nil {
-				return nil, "", "", errors.Trace(err)
+				return nil, "", "", err
 			}
 		case *ast.DropTableStmt:
-			err := g.storge.Delete(schema, table)
+			err := g.storge.Delete(tctx, schema, table)
 			if err != nil {
-				return nil, "", "", errors.Trace(err)
+				return nil, "", "", err
 			}
 		case *ast.RenameTableStmt:
 			if len(tables) != 2 {
-				return nil, "", "", errors.NotValidf("tables should contain old and new table name")
+				return nil, "", "", terror.ErrSyncerUnitGhostRenameTableNotValid.Generate()
 			}
 
 			tp1 := g.TableType(tables[1].Name)
@@ -109,21 +106,21 @@ func (g *Ghost) Apply(tables []*filter.Table, statement string, stmt ast.StmtNod
 				if ghostInfo != nil {
 					return ghostInfo.DDLs, tables[1].Schema, tables[1].Name, nil
 				}
-				return nil, "", "", errors.NotFoundf("online ddls on ghost table `%s`.`%s`", schema, table)
+				return nil, "", "", terror.ErrSyncerUnitGhostOnlineDDLOnGhostTbl.Generate(schema, table)
 			} else if tp1 == ghostTable {
-				return nil, "", "", errors.NotSupportedf("rename ghost table to other ghost table %s", statement)
+				return nil, "", "", terror.ErrSyncerUnitGhostRenameGhostTblToOther.Generate(statement)
 			}
 
 			// rename ghost table to trash table
-			err := g.storge.Delete(schema, table)
+			err := g.storge.Delete(tctx, schema, table)
 			if err != nil {
-				return nil, "", "", errors.Trace(err)
+				return nil, "", "", err
 			}
 
 		default:
-			err := g.storge.Save(schema, table, targetSchema, targetTable, statement)
+			err := g.storge.Save(tctx, schema, table, targetSchema, targetTable, statement)
 			if err != nil {
-				return nil, "", "", errors.Trace(err)
+				return nil, "", "", err
 			}
 		}
 	}
@@ -132,12 +129,12 @@ func (g *Ghost) Apply(tables []*filter.Table, statement string, stmt ast.StmtNod
 }
 
 // Finish implements interface
-func (g *Ghost) Finish(schema, table string) error {
+func (g *Ghost) Finish(tctx *tcontext.Context, schema, table string) error {
 	if g == nil {
 		return nil
 	}
 
-	return errors.Trace(g.storge.Delete(schema, table))
+	return g.storge.Delete(tctx, schema, table)
 }
 
 // TableType implements interface
@@ -167,11 +164,16 @@ func (g *Ghost) RealName(schema, table string) (string, string) {
 }
 
 // Clear clears online ddl information
-func (g *Ghost) Clear() error {
-	return errors.Trace(g.storge.Clear())
+func (g *Ghost) Clear(tctx *tcontext.Context) error {
+	return g.storge.Clear(tctx)
 }
 
 // Close implements interface
 func (g *Ghost) Close() {
 	g.storge.Close()
+}
+
+// ResetConn implements interface
+func (g *Ghost) ResetConn(tctx *tcontext.Context) error {
+	return g.storge.ResetConn(tctx)
 }

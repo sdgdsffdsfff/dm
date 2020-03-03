@@ -19,12 +19,14 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
 
+	"github.com/pingcap/dm/pkg/terror"
 	"github.com/pingcap/dm/pkg/utils"
 )
 
@@ -130,7 +132,7 @@ func (t *testFileSuite) TestCollectBinlogFilesCmp(c *C) {
 
 	// empty dir
 	files, err := CollectBinlogFilesCmp(dir, baseFile, cmp)
-	c.Assert(err, Equals, ErrEmptyRelayDir)
+	c.Assert(terror.ErrEmptyRelayDir.Equal(err), IsTrue)
 	c.Assert(files, IsNil)
 
 	// empty base filename, not found
@@ -217,7 +219,7 @@ func (t *testFileSuite) TestGetFirstBinlogName(c *C) {
 
 	// sub directory not exist
 	name, err := getFirstBinlogName(baseDir, uuid)
-	c.Assert(err, ErrorMatches, ".*no such file or directory.*")
+	c.Assert(err, ErrorMatches, ".*(no such file or directory|The system cannot find the file specified).*")
 	c.Assert(name, Equals, "")
 
 	// empty directory
@@ -270,7 +272,7 @@ func (t *testFileSuite) TestFileSizeUpdated(c *C) {
 
 	// file not exists
 	cmp, err := fileSizeUpdated(filePath, latestSize)
-	c.Assert(err, ErrorMatches, ".*no such file or directory.*")
+	c.Assert(err, ErrorMatches, ".*(no such file or directory|The system cannot find the file specified).*")
 	c.Assert(cmp, Equals, 0)
 
 	// create and write the file
@@ -312,7 +314,7 @@ func (t *testUtilSuite) TestRelaySubDirUpdated(c *C) {
 
 	// a. relay log dir not exist
 	upNotExist, err := relaySubDirUpdated(ctx, watcherInterval, "/not-exists-directory", "/not-exists-filepath", "not-exists-file", 0)
-	c.Assert(err, ErrorMatches, ".*no such file or directory.*")
+	c.Assert(err, ErrorMatches, ".*(no such file or directory|The system cannot find the file specified).*")
 	c.Assert(upNotExist, Equals, "")
 
 	// create relay log dir
@@ -333,7 +335,7 @@ func (t *testUtilSuite) TestRelaySubDirUpdated(c *C) {
 
 	// c. latest file path not exist
 	upNotExist, err = relaySubDirUpdated(ctx, watcherInterval, subDir, "/no-exists-filepath", relayFiles[0], 0)
-	c.Assert(err, ErrorMatches, ".*no such file or directory.*")
+	c.Assert(err, ErrorMatches, ".*(no such file or directory|The system cannot find the file specified).*")
 	c.Assert(upNotExist, Equals, "")
 
 	// 1. file increased when adding watching
@@ -475,7 +477,7 @@ func (t *testFileSuite) TestNeedSwitchSubDir(c *C) {
 	currentUUID = UUIDs[0]
 	needSwitch, needReParse, nextUUID, nextBinlogName, err = needSwitchSubDir(
 		relayDir, currentUUID, latestFilePath, latestFileSize, UUIDs)
-	c.Assert(err, ErrorMatches, fmt.Sprintf(".*%s.*no such file or directory.*", UUIDs[1]))
+	c.Assert(err, ErrorMatches, fmt.Sprintf(".*%s.*(no such file or directory|The system cannot find the file specified).*", UUIDs[1]))
 	c.Assert(needSwitch, IsFalse)
 	c.Assert(needReParse, IsFalse)
 	c.Assert(nextUUID, Equals, "")
@@ -492,7 +494,9 @@ func (t *testFileSuite) TestNeedSwitchSubDir(c *C) {
 	latestFilePath = filepath.Join(relayDir, UUIDs[0], "mysql-bin.000001")
 	needSwitch, needReParse, nextUUID, nextBinlogName, err = needSwitchSubDir(
 		relayDir, currentUUID, latestFilePath, latestFileSize, UUIDs)
-	c.Assert(err, ErrorMatches, fmt.Sprintf(".*%s.*no such file or directory.*", latestFilePath))
+	c.Assert(err, ErrorMatches, fmt.Sprintf(
+		".*%s.*(no such file or directory|The system cannot find the path specified).*",
+		regexp.QuoteMeta(latestFilePath)))
 	c.Assert(needSwitch, IsFalse)
 	c.Assert(needReParse, IsFalse)
 	c.Assert(nextUUID, Equals, "")

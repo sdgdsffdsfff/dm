@@ -3,8 +3,8 @@ name: test
 task-mode: all
 is-sharding: true
 meta-schema: "dm_meta"
-remove-meta: true
-disable-heartbeat: true
+remove-meta: false
+enable-heartbeat: false
 timezone: "Asia/Shanghai"
 online-ddl-scheme: online-ddl-scheme-placeholder
 
@@ -75,7 +75,7 @@ mydumpers:
     threads: 4
     chunk-filesize: 64
     skip-tz-utc: true
-    extra-args: "-B online_ddl"
+    extra-args: ""
 
 loaders:
   global:
@@ -86,4 +86,3 @@ syncers:
   global:
     worker-count: 16
     batch: 100
-    max-retry: 100

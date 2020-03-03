@@ -15,7 +15,7 @@ package master
 
 import (
 	"context"
-	"fmt"
+	"os"
 	"strconv"
 
 	"github.com/pingcap/errors"
@@ -30,8 +30,8 @@ import (
 // NewMigrateRelayCmd creates a MigrateRelay command
 func NewMigrateRelayCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "migrate-relay <worker> <binlogName> <binlogPos>",
-		Short: "migrate dm-worker's relay unit",
+		Use:   "migrate-relay <source> <binlogName> <binlogPos>",
+		Short: "migrate DM-worker's relay unit",
 		Run:   migrateRelayFunc,
 	}
 	return cmd
@@ -40,11 +40,12 @@ func NewMigrateRelayCmd() *cobra.Command {
 // MigrateRealyFunc does migrate relay request
 func migrateRelayFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) != 3 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 
-	worker := cmd.Flags().Arg(0)
+	source := cmd.Flags().Arg(0)
 	binlogName := cmd.Flags().Arg(1)
 	binlogPos, err := strconv.Atoi(cmd.Flags().Arg(2))
 	if err != nil {
@@ -58,7 +59,7 @@ func migrateRelayFunc(cmd *cobra.Command, _ []string) {
 	resp, err := cli.MigrateWorkerRelay(ctx, &pb.MigrateWorkerRelayRequest{
 		BinlogName: binlogName,
 		BinlogPos:  uint32(binlogPos),
-		Worker:     worker,
+		Source:     source,
 	})
 	if err != nil {
 		log.L().Error("can not migrate relay", zap.Error(err))

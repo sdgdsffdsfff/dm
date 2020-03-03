@@ -4,7 +4,7 @@ task-mode: all
 is-sharding: true
 meta-schema: "dm_meta"
 remove-meta: false
-disable-heartbeat: true
+enable-heartbeat: false
 timezone: "Asia/Shanghai"
 
 target-database:
@@ -71,7 +71,7 @@ mydumpers:
     threads: 4
     chunk-filesize: 64
     skip-tz-utc: true
-    extra-args: "-B safe_mode_test"
+    extra-args: ""
 
 loaders:
   global:
@@ -82,4 +82,3 @@ syncers:
   global:
     worker-count: 16
     batch: 100
-    max-retry: 100

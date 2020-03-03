@@ -16,6 +16,7 @@ package master
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/pingcap/errors"
 	"github.com/spf13/cobra"
@@ -27,8 +28,8 @@ import (
 // NewSwitchRelayMasterCmd creates a SwitchRelayMaster command
 func NewSwitchRelayMasterCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "switch-relay-master <-w worker ...>",
-		Short: "switch master server of dm-worker's relay unit",
+		Use:   "switch-relay-master <-s source ...>",
+		Short: "switch the master server of the DM-worker's relay unit",
 		Run:   switchRelayMasterFunc,
 	}
 	return cmd
@@ -37,17 +38,18 @@ func NewSwitchRelayMasterCmd() *cobra.Command {
 // switchRelayMasterFunc does switch relay master server
 func switchRelayMasterFunc(cmd *cobra.Command, _ []string) {
 	if len(cmd.Flags().Args()) > 0 {
-		fmt.Println(cmd.Usage())
+		cmd.SetOut(os.Stdout)
+		cmd.Usage()
 		return
 	}
 
-	workers, err := common.GetWorkerArgs(cmd)
+	sources, err := common.GetSourceArgs(cmd)
 	if err != nil {
 		fmt.Println(errors.ErrorStack(err))
 		return
 	}
-	if len(workers) == 0 {
-		fmt.Println("must specify at least one dm-worker (`-w` / `--worker`)")
+	if len(sources) == 0 {
+		fmt.Println("must specify at least one source (`-s` / `--source`)")
 		return
 	}
 
@@ -55,10 +57,10 @@ func switchRelayMasterFunc(cmd *cobra.Command, _ []string) {
 	defer cancel()
 	cli := common.MasterClient()
 	resp, err := cli.SwitchWorkerRelayMaster(ctx, &pb.SwitchWorkerRelayMasterRequest{
-		Workers: workers,
+		Sources: sources,
 	})
 	if err != nil {
-		common.PrintLines("can not switch relay's master server (in workers %v):\n%s", workers, errors.ErrorStack(err))
+		common.PrintLines("can not switch relay's master server (in sources %v):\n%s", sources, errors.ErrorStack(err))
 		return
 	}
 

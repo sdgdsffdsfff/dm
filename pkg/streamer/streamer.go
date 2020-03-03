@@ -15,20 +15,16 @@ package streamer
 
 import (
 	"context"
-	"errors"
 
 	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/terror"
 
+	"github.com/pingcap/failpoint"
 	"github.com/siddontang/go-mysql/replication"
+	"go.uber.org/zap"
 )
 
 // TODO: maybe one day we can make a pull request to go-mysql to support LocalStreamer.
-
-// errors used by streamer
-var (
-	ErrNeedSyncAgain = errors.New("Last sync error or closed, try sync and get event again")
-	ErrSyncClosed    = errors.New("Sync was closed")
-)
 
 // Streamer provides the ability to get binlog event from remote server or local file.
 type Streamer interface {
@@ -47,8 +43,13 @@ type LocalStreamer struct {
 // You can pass a context (like Cancel or Timeout) to break the block.
 func (s *LocalStreamer) GetEvent(ctx context.Context) (*replication.BinlogEvent, error) {
 	if s.err != nil {
-		return nil, ErrNeedSyncAgain
+		return nil, terror.ErrNeedSyncAgain.Generate()
 	}
+
+	failpoint.Inject("GetEventFromLocalFailed", func(_ failpoint.Value) {
+		log.L().Info("get event from local failed", zap.String("failpoint", "GetEventFromLocalFailed"))
+		failpoint.Return(nil, terror.ErrSyncClosed.Generate())
+	})
 
 	select {
 	case c := <-s.ch:
@@ -61,12 +62,12 @@ func (s *LocalStreamer) GetEvent(ctx context.Context) (*replication.BinlogEvent,
 }
 
 func (s *LocalStreamer) close() {
-	s.closeWithError(ErrSyncClosed)
+	s.closeWithError(terror.ErrSyncClosed.Generate())
 }
 
 func (s *LocalStreamer) closeWithError(err error) {
 	if err == nil {
-		err = ErrSyncClosed
+		err = terror.ErrSyncClosed.Generate()
 	}
 	log.L().Error("close local streamer", log.ShortError(err))
 	select {
